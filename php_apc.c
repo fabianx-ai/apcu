@@ -482,11 +482,13 @@ PHP_FUNCTION(apcu_rotate_segment)
 	if (size_is_null) {
 		new_size = apc_sma.size;
 	}
-	new_size = ALIGNWORD(new_size);
-	if (new_size < 1024 * 1024) {
-		php_error_docref(NULL, E_WARNING, "apcu_rotate_segment: new size must be at least 1MB");
+	/* Bound before ALIGNWORD so the round-up cannot overflow, and reject
+	 * absurd sizes up front. 1 TB is far above any real APCu segment. */
+	if (new_size < 1024 * 1024 || (zend_ulong)new_size > (1024ULL * 1024 * 1024 * 1024)) {
+		php_error_docref(NULL, E_WARNING, "apcu_rotate_segment: new size must be between 1MB and 1TB");
 		RETURN_FALSE;
 	}
+	new_size = ALIGNWORD(new_size);
 	if (snprintf(tmp_path, sizeof(tmp_path), "%s.new", path) >= (int)sizeof(tmp_path)) {
 		php_error_docref(NULL, E_WARNING, "apcu_rotate_segment: shared file path too long");
 		RETURN_FALSE;
@@ -556,6 +558,20 @@ PHP_FUNCTION(apcu_rotate_segment)
 			RETURN_FALSE;
 		}
 		apc_sma_init_segment(&tmp_sma, APC_ENTRY_SIZE(0));
+
+		/* apc_cache_create fatals (E_CORE_ERROR) if the header + slots array
+		 * does not fit — which, since the slot count follows apc.entries_hint
+		 * and not new_size, is reachable by rotating to a small size with a
+		 * large hint. Check first and fail softly instead of killing the
+		 * request, cleaning up the tmp segment. */
+		if (apc_cache_required_shm(&tmp_sma, APCG(entries_hint)) > tmp_sma.max_alloc_size) {
+			apc_unmap(tmp_sma.shmaddr, tmp_sma.size);
+			unlink(tmp_path);
+			close(lock_fd);
+			php_error_docref(NULL, E_WARNING, "apcu_rotate_segment: new size %zu is too small for the cache index at apc.entries_hint=" ZEND_LONG_FMT "; increase the size or lower the hint", tmp_sma.size, APCG(entries_hint));
+			RETURN_FALSE;
+		}
+
 		tmp_cache = apc_cache_create(
 			&tmp_sma, apc_user_cache->serializer,
 			APCG(entries_hint), APCG(gc_ttl), APCG(ttl), APCG(expunge_threshold), APCG(slam_defense));

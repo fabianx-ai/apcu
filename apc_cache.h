@@ -134,6 +134,12 @@ PHP_APCU_API apc_cache_t* apc_cache_create(
 PHP_APCU_API void apc_cache_shared_adopt(apc_cache_t *cache, apc_sma_t *sma);
 
 /*
+ * Shared memory apc_cache_create needs for the header + slots at this hint.
+ * Lets rotation reject a too-small target instead of fataling on allocation.
+ */
+PHP_APCU_API size_t apc_cache_required_shm(const apc_sma_t *sma, zend_long size_hint);
+
+/*
  * Best-effort copy of all live entries of old_cache into new_cache (a fresh
  * cache in a not-yet-published segment). Returns the migrated entry count.
  */
