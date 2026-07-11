@@ -70,6 +70,7 @@ typedef struct _apc_sma_t {
 	/* file-backed shared segment (apc.mmap_shared_file) state */
 	zend_bool shared_mode;         /* segment is backed by a named shared file */
 	zend_bool shared_attached;     /* attached to a segment initialized by another process */
+	uint64_t shared_seg_id;        /* id of the segment instance this process currently maps */
 } apc_sma_t;
 
 /*
@@ -126,6 +127,12 @@ PHP_APCU_API zend_bool apc_sma_shared_is_retired(const apc_sma_t *sma);
 
 /* Same check for a raw mapping that is not (yet) tracked by an apc_sma_t. */
 PHP_APCU_API zend_bool apc_sma_shared_addr_retired(void *shmaddr);
+
+/* Unique id of the segment instance at a raw mapping / currently mapped by sma.
+ * Used to detect that the file now at the shared path is a different segment
+ * instance than this process mapped (a rotation replaced it). */
+PHP_APCU_API uint64_t apc_sma_shared_addr_seg_id(void *shmaddr);
+PHP_APCU_API uint64_t apc_sma_shared_current_seg_id(const apc_sma_t *sma);
 
 /*
  * Marks the currently mapped segment as retired. Called by the rotating

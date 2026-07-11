@@ -515,6 +515,32 @@ PHP_FUNCTION(apcu_rotate_segment)
 			continue;
 		}
 
+		/* The file now at the path may be a newer segment instance than the
+		 * one we have mapped: a prior rotation could have published a
+		 * successor but died before tombstoning our segment, so the retired
+		 * check above stayed false. Rotating from our stale mapping would
+		 * migrate old data over the published segment and strand every process
+		 * attached to it. Detect the mismatch by segment id and adopt the
+		 * published segment before rotating. (We hold the flock, so no
+		 * concurrent rotation can move the file underneath this check.) */
+		{
+			size_t path_size = 0;
+			void *path_addr = apc_mmap_file_open_existing(path, &path_size);
+			if (path_addr) {
+				if (apc_sma_shared_validate(path_addr, path_size)
+						&& apc_sma_shared_addr_seg_id(path_addr) != apc_sma_shared_current_seg_id(&apc_sma)) {
+					old_addr = apc_sma.shmaddr;
+					old_size = apc_sma.size;
+					apc_sma_shared_swap(&apc_sma, path_addr, path_size);
+					apc_cache_shared_adopt(apc_user_cache, &apc_sma);
+					apc_unmap(old_addr, old_size);
+					close(lock_fd);
+					continue;
+				}
+				apc_unmap(path_addr, path_size);
+			}
+		}
+
 		/* Build the complete successor under a private name. */
 		unlink(tmp_path);
 		memset(&tmp_sma, 0, sizeof(tmp_sma));
@@ -549,7 +575,12 @@ PHP_FUNCTION(apcu_rotate_segment)
 			close(lock_fd);
 			RETURN_FALSE;
 		}
-		apc_sma_shared_retire(&apc_sma);
+		/* APCU_TEST_SKIP_RETIRE simulates a crash between rename() and retire:
+		 * the successor is published but the old segment is never tombstoned,
+		 * so other processes cannot follow via the retired flag. Test-only. */
+		if (!getenv("APCU_TEST_SKIP_RETIRE")) {
+			apc_sma_shared_retire(&apc_sma);
+		}
 
 		/* Switch this process over (we already map the successor). */
 		old_addr = apc_sma.shmaddr;

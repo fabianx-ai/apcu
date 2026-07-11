@@ -64,10 +64,13 @@ function shared_segment_cmd($seg, $code, $shm_size = '8M', $extra_ini = []) {
 	return $cmd . ' -r ' . escapeshellarg($code);
 }
 
-function shared_segment_run($seg, $code, $shm_size = '8M', $extra_ini = []) {
+function shared_segment_run($seg, $code, $shm_size = '8M', $extra_ini = [], $skip_retire = FALSE) {
 	$output = [];
 	$status = 0;
-	exec(shared_segment_cmd($seg, $code, $shm_size, $extra_ini) . ' 2>&1', $output, $status);
+	/* APCU_TEST_SKIP_RETIRE makes apcu_rotate_segment publish the successor
+	 * but skip tombstoning the old segment, simulating a crash in that window. */
+	$env = $skip_retire ? 'APCU_TEST_SKIP_RETIRE=1 ' : '';
+	exec($env . shared_segment_cmd($seg, $code, $shm_size, $extra_ini) . ' 2>&1', $output, $status);
 	return [implode("\n", $output), $status];
 }
 

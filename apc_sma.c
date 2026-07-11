@@ -34,6 +34,8 @@
 #include "apc_cache.h"
 
 #include <limits.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include "apc_mmap.h"
 
 #ifdef APC_SMA_DEBUG
@@ -52,6 +54,7 @@ typedef struct apc_shared_seg_info_t {
 	uint32_t php_version_id;  /* PHP_VERSION_ID of the creating process */
 	uint32_t layout_check;    /* sizeof checks of shm-resident structs */
 	uint32_t retired;         /* set once a successor segment replaced this one */
+	uint64_t seg_id;          /* unique id of this segment instance (identity across rotations) */
 	size_t segsize;           /* creator's segment size */
 	uintptr_t cache_off;      /* offset of the user cache header in the segment */
 	size_t cache_span;        /* bytes the cache header + slots array occupy */
@@ -100,6 +103,30 @@ static uint32_t apc_sma_layout_check(void) {
 		^ (sizeof(block_t) << 8)
 		^ (sizeof(apc_mutex_t) << 16)
 		^ (SIZEOF_SIZE_T << 24));
+}
+
+/*
+ * Generates an id that is unique per segment instance, so a process can tell
+ * whether the file now at the shared path is still the segment it has mapped
+ * (a rotation replaces the file). Best-effort randomness: /dev/urandom, with a
+ * pid/address/counter fallback that only needs to avoid collision between
+ * successive segments at one path on one host, not cryptographic strength.
+ */
+static uint64_t apc_sma_generate_seg_id(void) {
+	static uint64_t counter = 0;
+	uint64_t id = 0;
+	int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+
+	if (fd != -1) {
+		ssize_t n = read(fd, &id, sizeof(id));
+		close(fd);
+		if (n == (ssize_t)sizeof(id) && id != 0) {
+			return id;
+		}
+	}
+
+	id = ((uint64_t)getpid() << 32) ^ (uintptr_t)&counter ^ (++counter);
+	return id ? id : 1;
 }
 
 /* macros for getting the next or previous sequential block */
@@ -356,6 +383,8 @@ PHP_APCU_API void apc_sma_init_segment(apc_sma_t *sma, size_t min_alloc_size) {
 		info->php_version_id = (uint32_t)PHP_VERSION_ID;
 		info->layout_check = apc_sma_layout_check();
 		info->segsize = sma->size;
+		info->seg_id = apc_sma_generate_seg_id();
+		sma->shared_seg_id = info->seg_id;
 	}
 }
 
@@ -409,6 +438,7 @@ PHP_APCU_API void apc_sma_init(apc_sma_t* sma, void** data, apc_sma_expunge_f ex
 						- ALIGNWORD(sizeof(sma_header_t))
 						- 3 * ALIGNWORD(sizeof(block_t));
 					sma->shared_attached = 1;
+					sma->shared_seg_id = info->seg_id;
 					return;
 				}
 
@@ -486,6 +516,14 @@ PHP_APCU_API zend_bool apc_sma_shared_addr_retired(void *shmaddr) {
 	return ((sma_header_t *)shmaddr)->shared_info.retired != 0;
 }
 
+PHP_APCU_API uint64_t apc_sma_shared_addr_seg_id(void *shmaddr) {
+	return ((sma_header_t *)shmaddr)->shared_info.seg_id;
+}
+
+PHP_APCU_API uint64_t apc_sma_shared_current_seg_id(const apc_sma_t *sma) {
+	return sma->shared_seg_id;
+}
+
 PHP_APCU_API void apc_sma_shared_retire(apc_sma_t *sma) {
 	/* Guarded by the rotating process's flock on the segment file, not by
 	 * the cache lock: retirement must work even when the cache lock is
@@ -501,6 +539,7 @@ PHP_APCU_API void apc_sma_shared_swap(apc_sma_t *sma, void *new_addr, size_t new
 		- ALIGNWORD(sizeof(sma_header_t))
 		- 3 * ALIGNWORD(sizeof(block_t));
 	sma->shared_attached = 1;
+	sma->shared_seg_id = ((sma_header_t *)new_addr)->shared_info.seg_id;
 }
 
 PHP_APCU_API void apc_sma_detach(apc_sma_t* sma) {
