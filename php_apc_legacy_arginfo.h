@@ -1,8 +1,15 @@
 /* This is a generated file, edit the .stub.php file instead.
- * Stub hash: 5282d856fd334278d5799581ad251977a3c6b18e */
+ * Stub hash: 3455928fc65b7b9a805fa335bc571d4beb51e810 */
 
-ZEND_BEGIN_ARG_INFO_EX(arginfo_apcu_clear_cache, 0, 0, 0)
+ZEND_BEGIN_ARG_INFO_EX(arginfo_apcu_rotate_segment, 0, 0, 0)
+	ZEND_ARG_INFO(0, new_size)
+	ZEND_ARG_INFO(0, migrate)
 ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_apcu_segment_refresh, 0, 0, 0)
+ZEND_END_ARG_INFO()
+
+#define arginfo_apcu_clear_cache arginfo_apcu_segment_refresh
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_apcu_cache_info, 0, 0, 0)
 	ZEND_ARG_INFO(0, limited)
@@ -14,7 +21,7 @@ ZEND_END_ARG_INFO()
 
 #define arginfo_apcu_sma_info arginfo_apcu_cache_info
 
-#define arginfo_apcu_enabled arginfo_apcu_clear_cache
+#define arginfo_apcu_enabled arginfo_apcu_segment_refresh
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_apcu_store, 0, 0, 1)
 	ZEND_ARG_INFO(0, key)
@@ -60,7 +67,8 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_apcu_inc_request_time, 0, 0, 0)
 ZEND_END_ARG_INFO()
 #endif
 
-
+PHP_APCU_API ZEND_FUNCTION(apcu_rotate_segment);
+PHP_APCU_API ZEND_FUNCTION(apcu_segment_refresh);
 PHP_APCU_API ZEND_FUNCTION(apcu_clear_cache);
 PHP_APCU_API ZEND_FUNCTION(apcu_cache_info);
 PHP_APCU_API ZEND_FUNCTION(apcu_key_info);
@@ -79,8 +87,9 @@ PHP_APCU_API ZEND_FUNCTION(apcu_entry);
 PHP_APCU_API ZEND_FUNCTION(apcu_inc_request_time);
 #endif
 
-
 static const zend_function_entry ext_functions[] = {
+	ZEND_FE(apcu_rotate_segment, arginfo_apcu_rotate_segment)
+	ZEND_FE(apcu_segment_refresh, arginfo_apcu_segment_refresh)
 	ZEND_FE(apcu_clear_cache, arginfo_apcu_clear_cache)
 	ZEND_FE(apcu_cache_info, arginfo_apcu_cache_info)
 	ZEND_FE(apcu_key_info, arginfo_apcu_key_info)

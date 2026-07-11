@@ -1,8 +1,15 @@
 /* This is a generated file, edit the .stub.php file instead.
- * Stub hash: 5282d856fd334278d5799581ad251977a3c6b18e */
+ * Stub hash: 3455928fc65b7b9a805fa335bc571d4beb51e810 */
 
-ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_apcu_clear_cache, 0, 0, _IS_BOOL, 0)
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_apcu_rotate_segment, 0, 0, MAY_BE_LONG|MAY_BE_FALSE)
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, new_size, IS_LONG, 1, "null")
+	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, migrate, _IS_BOOL, 0, "true")
 ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_apcu_segment_refresh, 0, 0, _IS_BOOL, 0)
+ZEND_END_ARG_INFO()
+
+#define arginfo_apcu_clear_cache arginfo_apcu_segment_refresh
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_apcu_cache_info, 0, 0, MAY_BE_ARRAY|MAY_BE_FALSE)
 	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, limited, _IS_BOOL, 0, "false")
@@ -14,7 +21,7 @@ ZEND_END_ARG_INFO()
 
 #define arginfo_apcu_sma_info arginfo_apcu_cache_info
 
-#define arginfo_apcu_enabled arginfo_apcu_clear_cache
+#define arginfo_apcu_enabled arginfo_apcu_segment_refresh
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_apcu_store, 0, 1, MAY_BE_ARRAY|MAY_BE_BOOL)
 	ZEND_ARG_INFO(0, key)
@@ -62,16 +69,6 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_apcu_inc_request_time, 0, 0, IS_
 ZEND_END_ARG_INFO()
 #endif
 
-
-ZEND_BEGIN_ARG_WITH_RETURN_TYPE_MASK_EX(arginfo_apcu_rotate_segment, 0, 0, MAY_BE_LONG|MAY_BE_FALSE)
-	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, new_size, IS_LONG, 1, "null")
-	ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, migrate, _IS_BOOL, 0, "true")
-ZEND_END_ARG_INFO()
-
-ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_apcu_segment_refresh, 0, 0, _IS_BOOL, 0)
-ZEND_END_ARG_INFO()
-
-
 PHP_APCU_API ZEND_FUNCTION(apcu_rotate_segment);
 PHP_APCU_API ZEND_FUNCTION(apcu_segment_refresh);
 PHP_APCU_API ZEND_FUNCTION(apcu_clear_cache);
@@ -91,7 +88,6 @@ PHP_APCU_API ZEND_FUNCTION(apcu_entry);
 #if defined(APC_DEBUG)
 PHP_APCU_API ZEND_FUNCTION(apcu_inc_request_time);
 #endif
-
 
 static const zend_function_entry ext_functions[] = {
 	ZEND_FE(apcu_rotate_segment, arginfo_apcu_rotate_segment)
