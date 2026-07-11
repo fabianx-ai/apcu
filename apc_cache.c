@@ -744,19 +744,23 @@ PHP_APCU_API zend_bool apc_cache_add_ei(
 	}
 
 	/* Fast path: when the live entry's identifier already matches, nothing is
-	 * written and nothing is serialized — the write lock is held only for the
-	 * identifier comparison. */
-	if (!apc_cache_wlock(cache)) {
+	 * written and nothing is serialized. The read lock suffices: replacement,
+	 * GC and defragmentation all require the write lock, so the observed
+	 * (value, identifier) pair is the entry's current one for the duration of
+	 * the lock — the same discipline apc_cache_atomic_update_long relies on.
+	 * A matching wave of concurrent callers therefore proceeds in parallel,
+	 * like readers. Model: AddEi.tla (PairCoherent/NoStaleFresh). */
+	if (!apc_cache_rlock(cache)) {
 		return 0;
 	}
 
 	entry = apc_cache_rlocked_find_nostat(cache, key, t);
 	if (entry && apc_entry_ei_matches(entry, ei)) {
-		cache->header->nskipped++;
-		apc_cache_wunlock(cache);
+		ATOMIC_INC_RLOCKED(cache->header->nskipped);
+		apc_cache_runlock(cache);
 		return 0;
 	}
-	apc_cache_wunlock(cache);
+	apc_cache_runlock(cache);
 
 	/* run cache defense */
 	if (apc_cache_defense(cache, key, t)) {
