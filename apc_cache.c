@@ -308,6 +308,17 @@ PHP_APCU_API int APC_UNSERIALIZER_NAME(php) (APC_UNSERIALIZER_ARGS)
 }
 
 /*
+ * Returns the amount of shared memory apc_cache_create would allocate for the
+ * cache header + slots array given this size hint, so a caller (rotation) can
+ * check a candidate segment is large enough before building into it, instead
+ * of discovering the shortfall as a fatal allocation failure.
+ */
+PHP_APCU_API size_t apc_cache_required_shm(const apc_sma_t *sma, zend_long size_hint) {
+	size_t nslots = make_prime(size_hint > 0 ? (size_t)size_hint : sma->size / 2048);
+	return sizeof(apc_cache_header_t) + nslots * sizeof(uintptr_t);
+}
+
+/*
  * (Re-)points a cache at the shm structures of the shared segment currently
  * mapped by sma: the cache header, slots array and slot count recorded by
  * the segment's creator. Used at attach time and after a rotation swap.
@@ -418,7 +429,13 @@ PHP_APCU_API size_t apc_cache_shared_migrate(apc_cache_t *old_cache, apc_cache_t
 	size_t i, s, migrated = 0;
 	time_t t = apc_time();
 
-	if (!apc_lock_rlock(&old_cache->header->lock)) {
+	/* Take the WRITE lock, not a read lock: the in-place mutators that hold
+	 * only a read lock — apc_cache_atomic_update_long (apcu_inc/dec) and the
+	 * hit-count/access-time bumps in the fetch path — would otherwise rewrite
+	 * an entry's bytes while memcpy() below is copying them, capturing a
+	 * torn/stale value. Migration is off the hot path (a rare admin op), so
+	 * excluding writers for its duration is acceptable. */
+	if (!apc_lock_wlock(&old_cache->header->lock)) {
 		return 0;
 	}
 
@@ -460,7 +477,7 @@ PHP_APCU_API size_t apc_cache_shared_migrate(apc_cache_t *old_cache, apc_cache_t
 	}
 
 done:
-	apc_lock_runlock(&old_cache->header->lock);
+	apc_lock_wunlock(&old_cache->header->lock);
 	return migrated;
 }
 
