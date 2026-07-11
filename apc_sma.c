@@ -495,11 +495,23 @@ PHP_APCU_API void apc_sma_init(apc_sma_t* sma, void** data, apc_sma_expunge_f ex
 					apc_mmap_shared_release_lock();
 					apc_unmap(sma->shmaddr, mapped_size);
 					sma->shmaddr = NULL;
+				} else {
+					/* Sized file without the ready-magic — a previous
+					 * initialization crashed midway (the flock we hold proves no
+					 * live process is initializing it). Reserve storage before
+					 * re-initializing: the crash may have happened between the
+					 * creator's ftruncate and its fallocate, leaving the file
+					 * sparse (SIGBUS-on-ENOSPC window). Then fall through and
+					 * re-initialize as the creator. */
+					int rc = apc_mmap_shared_reserve_current(mapped_size);
+					if (rc != 0) {
+						snprintf(err, sizeof(err),
+							"cannot reserve %zu bytes for %s: %s", mapped_size, shared_file, strerror(rc));
+						apc_mmap_shared_release_lock();
+						apc_unmap(sma->shmaddr, mapped_size);
+						sma->shmaddr = NULL;
+					}
 				}
-				/* else: sized file without the ready-magic — a previous
-				 * initialization crashed midway (the flock we hold proves no
-				 * live process is initializing it); fall through and
-				 * re-initialize as the creator. */
 			}
 
 			if (!sma->shmaddr) {
