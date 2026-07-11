@@ -312,6 +312,30 @@ PHP_APCU_API apc_cache_t* apc_cache_create(apc_sma_t* sma, apc_serializer_t* ser
 	zend_long cache_size;
 	size_t nslots;
 
+	if (apc_sma_shared_attached(sma)) {
+		/* Another process initialized this segment: adopt its cache header
+		 * and slot count instead of creating new shm structures. */
+		char seg_serializer[APC_SHARED_SEG_SERIALIZER_LEN];
+		const char *serializer_name = serializer ? serializer->name : "php";
+
+		cache = pemalloc(sizeof(apc_cache_t), 1);
+		cache->header = apc_sma_shared_get_cache_info(sma, &nslots, seg_serializer);
+		cache->slots = (uintptr_t *)((uintptr_t)cache->header + sizeof(apc_cache_header_t));
+		cache->sma = sma;
+		cache->serializer = serializer;
+		cache->nslots = nslots;
+		cache->gc_ttl = gc_ttl;
+		cache->ttl = ttl;
+		cache->expunge_threshold = expunge_threshold;
+		cache->defend = defend;
+
+		if (strcmp(seg_serializer, serializer_name) != 0) {
+			apc_warning("apc.mmap_shared_file: segment was created with serializer '%s' but this process uses '%s'; entries may fail to unserialize", seg_serializer, serializer_name);
+		}
+
+		return cache;
+	}
+
 	/* calculate number of slots. Default: 512 slots per MB of shared memory */
 	nslots = make_prime(size_hint > 0 ? (size_t)size_hint : sma->size / 2048);
 
@@ -354,6 +378,12 @@ PHP_APCU_API apc_cache_t* apc_cache_create(apc_sma_t* sma, apc_serializer_t* ser
 
 	/* header lock */
 	CREATE_LOCK(&cache->header->lock);
+
+	if (sma->shared_mode) {
+		/* let attaching processes find the cache header and adopt our layout */
+		apc_sma_shared_set_cache_info(sma, cache->header, nslots,
+			serializer ? serializer->name : "php");
+	}
 
 	return cache;
 }

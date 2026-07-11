@@ -45,6 +45,7 @@ ZEND_BEGIN_MODULE_GLOBALS(apcu)
 
 #ifdef APC_MMAP
 	char *mmap_file_mask;         /* mktemp-style file-mask to pass to mmap */
+	char *mmap_shared_file;       /* fixed path of a file-backed segment shared across unrelated processes */
 	zend_long mmap_hugepage_size; /* hugepage size flag to pass to mmap (0: none)*/
 #endif
 

@@ -51,6 +51,10 @@ struct apc_sma_info_t {
 
 typedef zend_bool (*apc_sma_expunge_f)(void *pointer, size_t size);
 
+/* maximum stored length (incl. NUL) of the serializer name recorded in a
+ * file-backed shared segment for cross-process validation */
+#define APC_SHARED_SEG_SERIALIZER_LEN 16
+
 typedef struct _apc_sma_t {
 	zend_bool initialized;         /* flag to indicate this sma has been initialized */
 
@@ -62,16 +66,57 @@ typedef struct _apc_sma_t {
 	size_t size;                   /* segment size */
 	size_t max_alloc_size;         /* max size of memory available for allocation */
 	void  *shmaddr;                /* address of shm segment */
+
+	/* file-backed shared segment (apc.mmap_shared_file) state */
+	zend_bool shared_mode;         /* segment is backed by a named shared file */
+	zend_bool shared_attached;     /* attached to a segment initialized by another process */
 } apc_sma_t;
 
 /*
 * apc_sma_init will initialize a shared memory allocator with the given size of shared memory
 *
 * should be called once per allocator per process
+*
+* When shared_file is non-NULL and non-empty, the segment is backed by that
+* file so that unrelated processes (CLI and web SAPIs) can share it. The
+* first process initializes the segment, later processes attach to it; the
+* caller must invoke apc_sma_shared_mark_ready() + apc_mmap_shared_release_lock()
+* once all shm-resident structures are set up.
 */
 PHP_APCU_API void apc_sma_init(
 		apc_sma_t* sma, void** data, apc_sma_expunge_f expunge,
-		size_t size, size_t min_alloc_size, char *mask, zend_long hugepage_size);
+		size_t size, size_t min_alloc_size, char *mask, zend_long hugepage_size,
+		char *shared_file);
+
+/*
+ * Returns 1 when this process attached to a shared segment initialized by
+ * another process (in which case shm-resident structures must not be
+ * re-initialized).
+ */
+PHP_APCU_API zend_bool apc_sma_shared_attached(const apc_sma_t *sma);
+
+/*
+ * Records the location of the user cache header inside a shared segment,
+ * along with the slot count and serializer name, so attaching processes can
+ * adopt them. Only valid in shared mode, called by the creating process.
+ */
+PHP_APCU_API void apc_sma_shared_set_cache_info(
+		apc_sma_t *sma, void *cache_header, size_t nslots, const char *serializer_name);
+
+/*
+ * Returns the user cache header of a shared segment this process attached
+ * to, filling in the creator's slot count and serializer name.
+ * serializer_name must have room for APC_SHARED_SEG_SERIALIZER_LEN bytes.
+ */
+PHP_APCU_API void *apc_sma_shared_get_cache_info(
+		apc_sma_t *sma, size_t *nslots, char *serializer_name);
+
+/*
+ * Stamps the ready-magic into a shared segment. Must be the last step of
+ * segment initialization, before apc_mmap_shared_release_lock(). No-op when
+ * this process attached to an existing segment.
+ */
+PHP_APCU_API void apc_sma_shared_mark_ready(apc_sma_t *sma);
 
 /*
  * apc_sma_detach will detach from shared memory and cleanup local allocations.

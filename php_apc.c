@@ -33,6 +33,7 @@
 #include "apc_cache.h"
 #include "apc_iterator.h"
 #include "apc_sma.h"
+#include "apc_mmap.h"
 #include "apc_lock.h"
 #include "apc_mutex.h"
 #include "apc_strings.h"
@@ -162,6 +163,7 @@ STD_PHP_INI_ENTRY("apc.ttl",            "0",    PHP_INI_SYSTEM, OnUpdateLong,   
 STD_PHP_INI_ENTRY("apc.expunge_threshold", "0.5", PHP_INI_SYSTEM, OnUpdateExpungeThreshold, expunge_threshold, zend_apcu_globals, apcu_globals)
 #ifdef APC_MMAP
 STD_PHP_INI_ENTRY("apc.mmap_file_mask", NULL,   PHP_INI_SYSTEM, OnUpdateString,            mmap_file_mask,    zend_apcu_globals, apcu_globals)
+STD_PHP_INI_ENTRY("apc.mmap_shared_file", NULL, PHP_INI_SYSTEM, OnUpdateString,            mmap_shared_file,  zend_apcu_globals, apcu_globals)
 STD_PHP_INI_ENTRY("apc.mmap_hugepage_size", "0", PHP_INI_SYSTEM, OnUpdateMmapHugepageSize, mmap_hugepage_size, zend_apcu_globals, apcu_globals)
 #endif
 STD_PHP_INI_BOOLEAN("apc.enable_cli",   "0",    PHP_INI_SYSTEM, OnUpdateBool,              enable_cli,       zend_apcu_globals, apcu_globals)
@@ -190,6 +192,11 @@ static PHP_MINFO_FUNCTION(apcu)
 #ifdef APC_MMAP
 	php_info_print_table_row(2, "MMAP Support", "Enabled");
 	php_info_print_table_row(2, "MMAP File Mask", APCG(mmap_file_mask));
+	if (APCG(mmap_shared_file) && *APCG(mmap_shared_file)) {
+		php_info_print_table_row(2, "MMAP Shared File", APCG(mmap_shared_file));
+		php_info_print_table_row(2, "MMAP Shared Segment",
+			apc_sma_shared_attached(&apc_sma) ? "Attached" : "Created");
+	}
 #else
 	php_info_print_table_row(2, "MMAP Support", "Disabled");
 #endif
@@ -253,10 +260,12 @@ static PHP_MINIT_FUNCTION(apcu)
 
 		if (!APCG(initialized)) {
 			char *mmap_file_mask = NULL;
+			char *mmap_shared_file = NULL;
 			zend_long mmap_hugepage_size = 0;
 
 #ifdef APC_MMAP
 			mmap_file_mask = APCG(mmap_file_mask);
+			mmap_shared_file = APCG(mmap_shared_file);
 			mmap_hugepage_size = APCG(mmap_hugepage_size);
 #endif
 
@@ -266,7 +275,8 @@ static PHP_MINIT_FUNCTION(apcu)
 			/* initialize shared memory allocator */
 			apc_sma_init(
 				&apc_sma, (void **) &apc_user_cache, (apc_sma_expunge_f) apc_cache_default_expunge,
-				APCG(shm_size), APC_ENTRY_SIZE(0), mmap_file_mask, mmap_hugepage_size);
+				APCG(shm_size), APC_ENTRY_SIZE(0), mmap_file_mask, mmap_hugepage_size,
+				mmap_shared_file);
 
 			REGISTER_LONG_CONSTANT(APC_SERIALIZER_CONSTANT, (zend_long)&_apc_register_serializer, CONST_PERSISTENT | CONST_CS);
 
@@ -283,11 +293,21 @@ static PHP_MINIT_FUNCTION(apcu)
 				apc_find_serializer(APCG(serializer_name)),
 				APCG(entries_hint), APCG(gc_ttl), APCG(ttl), APCG(expunge_threshold), APCG(slam_defense));
 
-			/* preload data from path specified in configuration */
-			if (APCG(preload_path)) {
+			/* preload data from path specified in configuration; skip when
+			 * attached to a segment that was populated by another process */
+			if (APCG(preload_path) && !apc_sma_shared_attached(&apc_sma)) {
 				apc_cache_preload(
 					apc_user_cache, APCG(preload_path));
 			}
+
+#ifdef APC_MMAP
+			if (mmap_shared_file && *mmap_shared_file) {
+				/* all shm structures exist now: publish the segment and let
+				 * concurrently starting processes proceed */
+				apc_sma_shared_mark_ready(&apc_sma);
+				apc_mmap_shared_release_lock();
+			}
+#endif
 		}
 	}
 

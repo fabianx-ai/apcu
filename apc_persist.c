@@ -649,6 +649,10 @@ static zend_array *apc_unpersist_ht(
 	apc_unpersist_add_already_copied(ctxt, orig_ht, ht);
 	memcpy(ht, orig_ht, sizeof(HashTable));
 	GC_TYPE_INFO(ht) = GC_ARRAY;
+	/* The persisted pDestructor is a function pointer of the process that
+	 * stored the entry; with a shared segment that may be a different binary
+	 * (CLI vs FPM) or load address, so re-resolve it locally. */
+	ht->pDestructor = ZVAL_PTR_DTOR;
 #if PHP_VERSION_ID >= 70300
 	/* Caller used ZVAL_EMPTY_ARRAY and set different zval flags instead */
 	ZEND_ASSERT(ht->nNumOfElements > 0 && ht->nNumUsed > 0);

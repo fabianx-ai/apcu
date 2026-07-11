@@ -34,6 +34,8 @@
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/mman.h>
+#include <sys/file.h>
+#include <sys/stat.h>
 
 /*
  * Some operating systems (like FreeBSD) have a MAP_NOSYNC flag that
@@ -140,6 +142,71 @@ void apc_unmap(void *shmaddr, size_t size)
 {
 	if (munmap(shmaddr, size) < 0) {
 		apc_warning("apc_unmap: munmap failed");
+	}
+}
+
+/* fd backing the shared-file segment; kept open while the exclusive flock
+ * taken during create/attach is held, closed (releasing the lock) once the
+ * segment is fully initialized or validated. */
+static int apc_mmap_shared_lock_fd = -1;
+
+void *apc_mmap_shared(char *file_path, size_t size, zend_bool *existed)
+{
+	void *shmaddr;
+	struct stat st;
+	int fd, rc;
+
+	fd = open(file_path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+	if (fd == -1) {
+		zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: open on %s failed: %s", file_path, strerror(errno));
+	}
+
+	/* Serialize segment creation/attach across processes. The lock is held
+	 * beyond this function so that a process attaching concurrently cannot
+	 * observe a partially initialized segment. */
+	do {
+		rc = flock(fd, LOCK_EX);
+	} while (rc == -1 && errno == EINTR);
+	if (rc == -1) {
+		close(fd);
+		zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: flock on %s failed: %s", file_path, strerror(errno));
+	}
+
+	if (fstat(fd, &st) != 0) {
+		close(fd);
+		zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: fstat on %s failed: %s", file_path, strerror(errno));
+	}
+
+	if (st.st_size == 0) {
+		/* Fresh file: this process becomes the creator. */
+		*existed = 0;
+		if (ftruncate(fd, size) < 0) {
+			close(fd);
+			zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: ftruncate on %s failed: %s", file_path, strerror(errno));
+		}
+	} else if (st.st_size != (off_t)size) {
+		close(fd);
+		zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: %s has size %zd but apc.shm_size is %zu; remove the file or match apc.shm_size across all processes", file_path, (ssize_t)st.st_size, size);
+	} else {
+		*existed = 1;
+	}
+
+	shmaddr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NOSYNC, fd, 0);
+	if (shmaddr == MAP_FAILED) {
+		close(fd);
+		zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: failed to mmap %zu bytes of %s. apc.shm_size may be too large.", size, file_path);
+	}
+
+	apc_mmap_shared_lock_fd = fd;
+	return shmaddr;
+}
+
+void apc_mmap_shared_release_lock(void)
+{
+	if (apc_mmap_shared_lock_fd != -1) {
+		/* closing the fd releases the flock; the mapping stays valid */
+		close(apc_mmap_shared_lock_fd);
+		apc_mmap_shared_lock_fd = -1;
 	}
 }
 

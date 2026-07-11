@@ -43,11 +43,27 @@
 # define APC_SMA_CANARIES 1
 #endif
 
+/* Magic stamped into shared_info once a file-backed shared segment is fully
+ * initialized; processes seeing it may attach instead of initializing. */
+#define APC_SHARED_SEG_MAGIC 0x55435041 /* "APCU" */
+
+typedef struct apc_shared_seg_info_t {
+	uint32_t magic;           /* APC_SHARED_SEG_MAGIC once fully initialized */
+	uint32_t php_version_id;  /* PHP_VERSION_ID of the creating process */
+	uint32_t layout_check;    /* sizeof checks of shm-resident structs */
+	uint32_t reserved;
+	size_t segsize;           /* creator's segment size */
+	uintptr_t cache_off;      /* offset of the user cache header in the segment */
+	size_t nslots;            /* user cache slot count chosen by the creator */
+	char serializer[APC_SHARED_SEG_SERIALIZER_LEN]; /* creator's serializer name */
+} apc_shared_seg_info_t;
+
 typedef struct sma_header_t sma_header_t;
 struct sma_header_t {
 	apc_mutex_t sma_lock;   /* segment lock */
 	size_t min_block_size;  /* expected minimum size of allocated blocks */
 	size_t avail;           /* bytes available (not necessarily contiguous) */
+	apc_shared_seg_info_t shared_info; /* only used with apc.mmap_shared_file */
 };
 
 #define SMA_DEFAULT_SEGSIZE (30*1024*1024)
@@ -77,6 +93,13 @@ struct block_t {
  * beginning of the shared memory segment. */
 #define BLOCKAT(offset) ((block_t*)((char *)smaheader + offset))
 #define OFFSET(block) ((size_t)(((char*)block) - (char*)smaheader))
+
+static uint32_t apc_sma_layout_check(void) {
+	return (uint32_t)(sizeof(sma_header_t)
+		^ (sizeof(block_t) << 8)
+		^ (sizeof(apc_mutex_t) << 16)
+		^ (SIZEOF_SIZE_T << 24));
+}
 
 /* macros for getting the next or previous sequential block */
 #define NEXT_SBLOCK(block) ((block_t*)((char*)block + block->size))
@@ -253,7 +276,7 @@ static APC_HOTSPOT size_t sma_deallocate(sma_header_t *smaheader, size_t offset)
 	return size;
 }
 
-PHP_APCU_API void apc_sma_init(apc_sma_t* sma, void** data, apc_sma_expunge_f expunge, size_t size, size_t min_alloc_size, char *mask, zend_long hugepage_size) {
+PHP_APCU_API void apc_sma_init(apc_sma_t* sma, void** data, apc_sma_expunge_f expunge, size_t size, size_t min_alloc_size, char *mask, zend_long hugepage_size, char *shared_file) {
 	if (sma->initialized) {
 		return;
 	}
@@ -262,9 +285,52 @@ PHP_APCU_API void apc_sma_init(apc_sma_t* sma, void** data, apc_sma_expunge_f ex
 	sma->expunge = expunge;
 	sma->data = data;
 	sma->size = ALIGNWORD(size > 0 ? size : SMA_DEFAULT_SEGSIZE);
+	sma->shared_mode = 0;
+	sma->shared_attached = 0;
 
 #ifdef APC_MMAP
-	sma->shmaddr = apc_mmap(mask, sma->size, hugepage_size);
+	if (shared_file && *shared_file) {
+		zend_bool existed = 0;
+
+		if (hugepage_size) {
+			zend_error_noreturn(E_CORE_ERROR, "apc.mmap_hugepage_size cannot be combined with apc.mmap_shared_file");
+		}
+
+		sma->shared_mode = 1;
+		sma->shmaddr = apc_mmap_shared(shared_file, sma->size, &existed);
+
+		if (existed) {
+			sma_header_t *smaheader = sma->shmaddr;
+			apc_shared_seg_info_t *info = &smaheader->shared_info;
+
+			if (info->magic == APC_SHARED_SEG_MAGIC) {
+				/* Fully initialized segment from another process: validate
+				 * compatibility, then attach without touching shm state. */
+				if (info->php_version_id != (uint32_t)PHP_VERSION_ID
+						|| info->layout_check != apc_sma_layout_check()
+						|| info->segsize != sma->size) {
+					zend_error_noreturn(E_CORE_ERROR,
+						"apc.mmap_shared_file: existing segment in %s is incompatible "
+						"(created by PHP version id %u with segment size %zu); "
+						"remove the file or align PHP version and apc.shm_size across processes",
+						shared_file, info->php_version_id, info->segsize);
+				}
+
+				/* Recompute max_alloc_size exactly as the creator did from
+				 * the initial avail; header->avail has changed since. */
+				sma->max_alloc_size = sma->size
+					- ALIGNWORD(sizeof(sma_header_t))
+					- 3 * ALIGNWORD(sizeof(block_t));
+				sma->shared_attached = 1;
+				return;
+			}
+			/* Sized file without the ready-magic: a previous initialization
+			 * crashed midway (the flock we hold proves no live process is
+			 * initializing it). Fall through and re-initialize. */
+		}
+	} else {
+		sma->shmaddr = apc_mmap(mask, sma->size, hugepage_size);
+	}
 #else
 	sma->shmaddr = apc_shm_attach(sma->size);
 #endif
@@ -295,6 +361,56 @@ PHP_APCU_API void apc_sma_init(apc_sma_t* sma, void** data, apc_sma_expunge_f ex
 	last->fprev =  OFFSET(empty);
 	last->prev_size = empty->size;
 	SET_CANARY(last);
+
+	if (sma->shared_mode) {
+		/* Record compatibility data for attaching processes. The magic is
+		 * deliberately not set here: apc_sma_shared_mark_ready() stamps it
+		 * once all shm-resident structures (including the user cache) exist. */
+		apc_shared_seg_info_t *info = &smaheader->shared_info;
+		memset(info, 0, sizeof(*info));
+		info->php_version_id = (uint32_t)PHP_VERSION_ID;
+		info->layout_check = apc_sma_layout_check();
+		info->segsize = sma->size;
+	}
+}
+
+PHP_APCU_API zend_bool apc_sma_shared_attached(const apc_sma_t *sma) {
+	return sma->shared_attached;
+}
+
+PHP_APCU_API void apc_sma_shared_set_cache_info(
+		apc_sma_t *sma, void *cache_header, size_t nslots, const char *serializer_name) {
+	sma_header_t *smaheader = sma->shmaddr;
+	apc_shared_seg_info_t *info = &smaheader->shared_info;
+
+	ZEND_ASSERT(sma->shared_mode && !sma->shared_attached);
+
+	info->cache_off = (uintptr_t)((char *)cache_header - (char *)sma->shmaddr);
+	info->nslots = nslots;
+	strncpy(info->serializer, serializer_name ? serializer_name : "php",
+		APC_SHARED_SEG_SERIALIZER_LEN - 1);
+}
+
+PHP_APCU_API void *apc_sma_shared_get_cache_info(
+		apc_sma_t *sma, size_t *nslots, char *serializer_name) {
+	sma_header_t *smaheader = sma->shmaddr;
+	apc_shared_seg_info_t *info = &smaheader->shared_info;
+
+	ZEND_ASSERT(sma->shared_attached);
+
+	*nslots = info->nslots;
+	memcpy(serializer_name, info->serializer, APC_SHARED_SEG_SERIALIZER_LEN);
+	serializer_name[APC_SHARED_SEG_SERIALIZER_LEN - 1] = '\0';
+	return (char *)sma->shmaddr + info->cache_off;
+}
+
+PHP_APCU_API void apc_sma_shared_mark_ready(apc_sma_t *sma) {
+	sma_header_t *smaheader = sma->shmaddr;
+
+	if (!sma->shared_mode || sma->shared_attached) {
+		return;
+	}
+	smaheader->shared_info.magic = APC_SHARED_SEG_MAGIC;
 }
 
 PHP_APCU_API void apc_sma_detach(apc_sma_t* sma) {

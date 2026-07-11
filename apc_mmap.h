@@ -37,6 +37,19 @@
 #ifdef APC_MMAP
 void *apc_mmap(char *file_mask, size_t size, zend_long hugepage_size);
 void apc_unmap(void *shmaddr, size_t size);
+
+/*
+ * Maps a shared segment backed by a regular file at a fixed path, so that
+ * independent PHP processes (e.g. CLI and FPM) can map the same segment.
+ * The file is created and sized on first use; subsequent processes attach.
+ * On return the process holds an exclusive flock on the file; the caller
+ * must call apc_mmap_shared_release_lock() once segment initialization (or
+ * attach validation) is complete. *existed is set to 1 when a file of the
+ * expected size was already present (attach candidate), 0 when this process
+ * created the file and must initialize the segment.
+ */
+void *apc_mmap_shared(char *file_path, size_t size, zend_bool *existed);
+void apc_mmap_shared_release_lock(void);
 #endif
 
 #endif
