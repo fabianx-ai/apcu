@@ -58,6 +58,17 @@
 /* Defined in apc_persist.c */
 apc_cache_entry_t *apc_persist(
 		apc_sma_t *sma, apc_serializer_t *serializer, zend_string *key, const zval *val);
+apc_cache_entry_t *apc_persist_ex(
+		apc_sma_t *sma, apc_serializer_t *serializer, zend_string *key, const zval *val,
+		unsigned char *serialized_str, size_t serialized_str_len);
+zend_bool apc_persist_serialize_value(
+		apc_serializer_t *serializer, const zval *zv,
+		unsigned char **buf, size_t *buf_len);
+zend_bool apc_entry_value_identical(
+		const apc_cache_entry_t *entry, const zval *val,
+		const unsigned char *serialized_str, size_t serialized_str_len);
+zend_bool apc_entry_payloads_identical(
+		const apc_cache_entry_t *a, const apc_cache_entry_t *b);
 zend_bool apc_unpersist(zval *dst, const apc_cache_entry_t *entry, apc_serializer_t *serializer);
 
 /* make_prime */
@@ -359,7 +370,7 @@ PHP_APCU_API apc_cache_t* apc_cache_create(apc_sma_t* sma, apc_serializer_t* ser
 }
 
 static inline zend_bool apc_cache_wlocked_insert(
-		apc_cache_t *cache, apc_cache_entry_t *new_entry, zend_bool exclusive) {
+		apc_cache_t *cache, apc_cache_entry_t *new_entry, zend_bool exclusive, zend_bool *skipped) {
 	zend_string *key = &new_entry->key;
 	time_t t = new_entry->ctime;
 	size_t s;
@@ -383,6 +394,22 @@ static inline zend_bool apc_cache_wlocked_insert(
 			 */
 			if (exclusive && !apc_cache_entry_hard_expired(entry, t)) {
 				return 0;
+			}
+
+			/*
+			 * apc_cache_store_if_changed: if the live entry's value is identical
+			 * to the new one, refresh its metadata instead of replacing it. The
+			 * caller frees the unused new entry.
+			 */
+			if (skipped && !apc_cache_entry_hard_expired(entry, t)
+					&& apc_entry_payloads_identical(entry, new_entry)) {
+				entry->ttl = new_entry->ttl;
+				entry->ctime = new_entry->ctime;
+				entry->mtime = new_entry->mtime;
+				entry->atime = new_entry->atime;
+				cache->header->nskipped++;
+				*skipped = 1;
+				return 1;
 			}
 
 			apc_cache_wlocked_remove_entry(cache, entry);
@@ -444,7 +471,7 @@ static inline zend_bool apc_cache_wlocked_store_internal(
 	apc_cache_set_entry_values(entry, ttl, t);
 
 	/* execute an insertion */
-	if (!apc_cache_wlocked_insert(cache, entry, exclusive)) {
+	if (!apc_cache_wlocked_insert(cache, entry, exclusive, NULL)) {
 		free_entry(cache, entry);
 		return 0;
 	}
@@ -558,7 +585,7 @@ PHP_APCU_API zend_bool apc_cache_store(
 	}
 
 	php_apc_try {
-		ret = apc_cache_wlocked_insert(cache, entry, exclusive);
+		ret = apc_cache_wlocked_insert(cache, entry, exclusive, NULL);
 	} php_apc_finally {
 		apc_cache_wunlock(cache);
 
@@ -567,6 +594,121 @@ PHP_APCU_API zend_bool apc_cache_store(
 			apc_cache_entry_release(cache, entry);
 		} else {
 			/* the entry mustn't be released before it is freed to prevent defragmentation from moving the entry */
+			free_entry(cache, entry);
+		}
+	} php_apc_end_try();
+
+	return ret;
+}
+
+/* Find the live entry for key and, when its value is identical to the candidate,
+ * refresh its metadata as if it had been stored. Must be called under write lock. */
+static zend_bool apc_cache_wlocked_refresh_identical(
+		apc_cache_t *cache, zend_string *key, const zval *val,
+		const unsigned char *serialized_str, size_t serialized_str_len,
+		const zend_long ttl, time_t t) {
+	apc_cache_entry_t *entry = apc_cache_rlocked_find_nostat(cache, key, t);
+
+	if (!entry || !apc_entry_value_identical(entry, val, serialized_str, serialized_str_len)) {
+		return 0;
+	}
+
+	entry->ttl = ttl;
+	entry->ctime = t;
+	entry->mtime = t;
+	entry->atime = t;
+	cache->header->nskipped++;
+	return 1;
+}
+
+PHP_APCU_API zend_bool apc_cache_store_if_changed(
+		apc_cache_t *cache, zend_string *key, const zval *val, const zend_long ttl) {
+	time_t t = apc_time();
+	unsigned char *serialized_str = NULL;
+	size_t serialized_str_len = 0;
+	zend_bool have_compare_form = 0;
+	zend_bool skipped = 0;
+	zend_bool ret = 0;
+	apc_cache_entry_t *entry;
+
+	if (!cache) {
+		return 0;
+	}
+
+	/* Build a request-local comparison form where one exists without touching
+	 * shm: scalars and strings compare directly; objects (and arrays under an
+	 * explicit serializer) are serialized here — apc_persist_ex() below reuses
+	 * the buffer, so the store path serializes exactly once. Structurally
+	 * persisted arrays have no cheap comparison form and take the plain store
+	 * path (their identical stores are not skipped). */
+	if (Z_TYPE_P(val) <= IS_STRING) {
+		have_compare_form = 1;
+	} else if (Z_TYPE_P(val) == IS_OBJECT
+			|| (cache->serializer && Z_TYPE_P(val) == IS_ARRAY)) {
+		if (!apc_persist_serialize_value(
+				cache->serializer, val, &serialized_str, &serialized_str_len)) {
+			/* apc_persist() would fail the same way in apc_cache_store() */
+			return 0;
+		}
+		have_compare_form = 1;
+	}
+
+	if (have_compare_form) {
+		if (!apc_cache_wlock(cache)) {
+			if (serialized_str) {
+				efree(serialized_str);
+			}
+			return 0;
+		}
+
+		skipped = apc_cache_wlocked_refresh_identical(
+			cache, key, val, serialized_str, serialized_str_len, ttl, t);
+		apc_cache_wunlock(cache);
+
+		if (skipped) {
+			if (serialized_str) {
+				efree(serialized_str);
+			}
+			return 1;
+		}
+	}
+
+	/* run cache defense */
+	if (apc_cache_defense(cache, key, t)) {
+		if (serialized_str) {
+			efree(serialized_str);
+		}
+		return 0;
+	}
+
+	/* create entry in the shared memory (takes ownership of serialized_str) */
+	entry = apc_persist_ex(
+		cache->sma, cache->serializer, key, val, serialized_str, serialized_str_len);
+	if (!entry) {
+		return 0;
+	}
+
+	/* init remaining values of the entry */
+	apc_cache_set_entry_values(entry, ttl, t);
+
+	if (!apc_cache_wlock(cache)) {
+		free_entry(cache, entry);
+		return 0;
+	}
+
+	php_apc_try {
+		/* The stored value may have become identical to ours since the compare
+		 * above; the insert re-checks under the lock before replacing. */
+		ret = apc_cache_wlocked_insert(cache, entry, 0, &skipped);
+	} php_apc_finally {
+		apc_cache_wunlock(cache);
+
+		if (ret && !skipped) {
+			/* release entry, because the ref_count of a new entry is initialized to 1 during allocation */
+			apc_cache_entry_release(cache, entry);
+		} else {
+			/* unused (skipped) or failed candidate; it was never linked, so free it.
+			 * It mustn't be released first, to prevent defragmentation from moving it. */
 			free_entry(cache, entry);
 		}
 	} php_apc_end_try();
@@ -735,6 +877,7 @@ static void apc_cache_wlocked_real_expunge(apc_cache_t* cache) {
 
 	/* reset counters */
 	cache->header->ninserts = 0;
+	cache->header->nskipped = 0;
 	cache->header->nentries = 0;
 	cache->header->nhits = 0;
 	cache->header->nmisses = 0;
@@ -1097,6 +1240,7 @@ PHP_APCU_API zend_bool apc_cache_info(zval *info, apc_cache_t *cache, zend_bool 
 		array_add_double(info, apc_str_num_hits, (double) cache->header->nhits);
 		add_assoc_double(info, "num_misses", (double) cache->header->nmisses);
 		add_assoc_double(info, "num_inserts", (double) cache->header->ninserts);
+		add_assoc_double(info, "num_skipped", (double) cache->header->nskipped);
 		add_assoc_long(info,   "num_entries", cache->header->nentries);
 		add_assoc_long(info, "cleanups", cache->header->ncleanups);
 		add_assoc_long(info, "defragmentations", cache->header->ndefragmentations);

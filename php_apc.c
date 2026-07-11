@@ -449,7 +449,25 @@ zend_bool php_apc_update(
 	return apc_cache_atomic_update_long(apc_user_cache, key, updater, data, insert_if_not_found, ttl);
 }
 
-static void apc_store_helper(INTERNAL_FUNCTION_PARAMETERS, const zend_bool exclusive)
+typedef enum {
+	APC_STORE_MODE_STORE,  /* apcu_store: always store */
+	APC_STORE_MODE_ADD,    /* apcu_add: store only if no live entry exists */
+	APC_STORE_MODE_UPDATE, /* apcu_update: store unless the stored value is identical */
+} apc_store_mode_t;
+
+static zend_bool apc_store_helper_one(zend_string *key, zval *val, zend_long ttl, apc_store_mode_t mode)
+{
+	switch (mode) {
+		case APC_STORE_MODE_ADD:
+			return apc_cache_store(apc_user_cache, key, val, ttl, 1);
+		case APC_STORE_MODE_UPDATE:
+			return apc_cache_store_if_changed(apc_user_cache, key, val, ttl);
+		default:
+			return apc_cache_store(apc_user_cache, key, val, ttl, 0);
+	}
+}
+
+static void apc_store_helper(INTERNAL_FUNCTION_PARAMETERS, const apc_store_mode_t mode)
 {
 	zval *key;
 	zval *val = NULL;
@@ -486,7 +504,7 @@ static void apc_store_helper(INTERNAL_FUNCTION_PARAMETERS, const zend_bool exclu
 			} else {
 				hkey = zend_long_to_str(hkey_idx);
 			}
-			if (!apc_cache_store(apc_user_cache, hkey, hentry, ttl, exclusive)) {
+			if (!apc_store_helper_one(hkey, hentry, ttl, mode)) {
 				zend_symtable_add_new(Z_ARRVAL_P(return_value), hkey, &fail_zv);
 			}
 			zend_string_release(hkey);
@@ -498,7 +516,7 @@ static void apc_store_helper(INTERNAL_FUNCTION_PARAMETERS, const zend_bool exclu
 			RETURN_FALSE;
 		}
 
-		RETURN_BOOL(apc_cache_store(apc_user_cache, Z_STR_P(key), val, ttl, exclusive));
+		RETURN_BOOL(apc_store_helper_one(Z_STR_P(key), val, ttl, mode));
 	} else {
 		apc_warning("apc_store expects key parameter to be a string or an array of key/value pairs.");
 		RETURN_FALSE;
@@ -515,12 +533,18 @@ PHP_FUNCTION(apcu_enabled) {
 
 /* proto int apcu_store(mixed key, mixed var [, long ttl ]) */
 PHP_FUNCTION(apcu_store) {
-	apc_store_helper(INTERNAL_FUNCTION_PARAM_PASSTHRU, 0);
+	apc_store_helper(INTERNAL_FUNCTION_PARAM_PASSTHRU, APC_STORE_MODE_STORE);
 }
 
 /* proto int apcu_add(mixed key, mixed var [, long ttl ]) */
 PHP_FUNCTION(apcu_add) {
-	apc_store_helper(INTERNAL_FUNCTION_PARAM_PASSTHRU, 1);
+	apc_store_helper(INTERNAL_FUNCTION_PARAM_PASSTHRU, APC_STORE_MODE_ADD);
+}
+
+/* proto int apcu_update(mixed key, mixed var [, long ttl ])
+   Store like apcu_store, but skip the write when the stored value is identical (GH #355) */
+PHP_FUNCTION(apcu_update) {
+	apc_store_helper(INTERNAL_FUNCTION_PARAM_PASSTHRU, APC_STORE_MODE_UPDATE);
 }
 
 struct php_inc_updater_args {

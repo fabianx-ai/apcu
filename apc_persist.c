@@ -191,27 +191,37 @@ static zend_bool apc_persist_calc_ht(apc_persist_context_t *ctxt, const HashTabl
 	return 1;
 }
 
-static zend_bool apc_persist_calc_serialize(apc_persist_context_t *ctxt, const zval *zv) {
-	unsigned char *buf = NULL;
-	size_t buf_len = 0;
-
+/* Serialize a value the same way persisting it would, into a request-local buffer. */
+zend_bool apc_persist_serialize_value(
+		apc_serializer_t *serializer, const zval *zv,
+		unsigned char **buf, size_t *buf_len) {
 	apc_serialize_t serialize = APC_SERIALIZER_NAME(php);
 	void *config = NULL;
-	if (ctxt->serializer) {
-		serialize = ctxt->serializer->serialize;
-		config = ctxt->serializer->config;
+	if (serializer) {
+		serialize = serializer->serialize;
+		config = serializer->config;
 	}
 
-	if (!serialize(&buf, &buf_len, zv, config)) {
-		return 0;
+	return serialize(buf, buf_len, zv, config);
+}
+
+static zend_bool apc_persist_calc_serialize(apc_persist_context_t *ctxt, const zval *zv) {
+	/* The caller may have serialized the value already (apc_persist_ex) */
+	if (!ctxt->serialized_str) {
+		unsigned char *buf = NULL;
+		size_t buf_len = 0;
+
+		if (!apc_persist_serialize_value(ctxt->serializer, zv, &buf, &buf_len)) {
+			return 0;
+		}
+
+		/* We only ever serialize the top-level value, memoization cannot be needed */
+		ZEND_ASSERT(!ctxt->memoization_needed);
+		ctxt->serialized_str = buf;
+		ctxt->serialized_str_len = buf_len;
 	}
 
-	/* We only ever serialize the top-level value, memoization cannot be needed */
-	ZEND_ASSERT(!ctxt->memoization_needed);
-	ctxt->serialized_str = buf;
-	ctxt->serialized_str_len = buf_len;
-
-	ADD_SIZE_STR(buf_len);
+	ADD_SIZE_STR(ctxt->serialized_str_len);
 	return 1;
 }
 
@@ -483,8 +493,9 @@ static void apc_persist_sma_init_entry(apc_cache_entry_t *entry) {
 	entry->ref_count = 1;
 }
 
-apc_cache_entry_t *apc_persist(
-		apc_sma_t *sma, apc_serializer_t *serializer, zend_string *key, const zval *val) {
+apc_cache_entry_t *apc_persist_ex(
+		apc_sma_t *sma, apc_serializer_t *serializer, zend_string *key, const zval *val,
+		unsigned char *serialized_str, size_t serialized_str_len) {
 	apc_persist_context_t ctxt;
 	apc_cache_entry_t *entry;
 
@@ -506,6 +517,16 @@ apc_cache_entry_t *apc_persist(
 	if (Z_TYPE_P(val) == IS_OBJECT
 			|| (serializer && Z_TYPE_P(val) == IS_ARRAY)) {
 		ctxt.use_serialization = 1;
+	}
+
+	/* The caller may pass the value's serialized form, avoiding a second
+	 * serialization. Ownership of the buffer transfers to this function
+	 * (it is freed with the context in all paths). Only values that are
+	 * serialized unconditionally may be pre-serialized. */
+	if (serialized_str) {
+		ZEND_ASSERT(ctxt.use_serialization);
+		ctxt.serialized_str = serialized_str;
+		ctxt.serialized_str_len = serialized_str_len;
 	}
 
 	if (!apc_persist_calc(&ctxt, key, val)) {
@@ -537,6 +558,89 @@ apc_cache_entry_t *apc_persist(
 
 	apc_persist_destroy_context(&ctxt);
 	return entry;
+}
+
+apc_cache_entry_t *apc_persist(
+		apc_sma_t *sma, apc_serializer_t *serializer, zend_string *key, const zval *val) {
+	return apc_persist_ex(sma, serializer, key, val, NULL, 0);
+}
+
+/*
+ * COMPARE: Check whether a stored entry's value is identical to a candidate,
+ * so that rewriting identical data can be skipped (apcu_update, GH #355).
+ * All helpers are best-effort: false negatives merely cause an ordinary store.
+ * Entries store pointers as entry-relative offsets, so payload strings are
+ * resolved against the entry's own address.
+ */
+
+static zend_always_inline const zend_string *apc_entry_str_at(const apc_cache_entry_t *entry) {
+	return (const zend_string *)((const char *)entry + (uintptr_t)Z_PTR(entry->val));
+}
+
+static zend_always_inline zend_bool apc_entry_str_identical(
+		const zend_string *stored, const char *buf, size_t len) {
+	return ZSTR_LEN(stored) == len && memcmp(ZSTR_VAL(stored), buf, len) == 0;
+}
+
+/* Compare a stored entry against a request-local value. When serialized_str is
+ * non-NULL it is the serialized form of val and takes precedence. */
+zend_bool apc_entry_value_identical(
+		const apc_cache_entry_t *entry, const zval *val,
+		const unsigned char *serialized_str, size_t serialized_str_len) {
+	if (serialized_str) {
+		return Z_TYPE(entry->val) == IS_PTR
+			&& apc_entry_str_identical(
+				apc_entry_str_at(entry), (const char *) serialized_str, serialized_str_len);
+	}
+
+	if (Z_TYPE(entry->val) != Z_TYPE_P(val)) {
+		return 0;
+	}
+
+	switch (Z_TYPE_P(val)) {
+		case IS_NULL:
+		case IS_FALSE:
+		case IS_TRUE:
+			return 1;
+		case IS_LONG:
+			return Z_LVAL(entry->val) == Z_LVAL_P(val);
+		case IS_DOUBLE:
+			/* Bitwise: a skip must guarantee the stored bytes would not change */
+			return memcmp(&Z_DVAL(entry->val), &Z_DVAL_P(val), sizeof(double)) == 0;
+		case IS_STRING:
+			return apc_entry_str_identical(
+				apc_entry_str_at(entry), Z_STRVAL_P(val), Z_STRLEN_P(val));
+		default:
+			return 0;
+	}
+}
+
+/* Compare the value payloads of two persisted entries. Structurally persisted
+ * arrays are never reported identical: their blocks contain uninitialized
+ * alignment padding, so their bytes are not comparable. */
+zend_bool apc_entry_payloads_identical(
+		const apc_cache_entry_t *a, const apc_cache_entry_t *b) {
+	if (Z_TYPE(a->val) != Z_TYPE(b->val)) {
+		return 0;
+	}
+
+	switch (Z_TYPE(a->val)) {
+		case IS_NULL:
+		case IS_FALSE:
+		case IS_TRUE:
+			return 1;
+		case IS_LONG:
+			return Z_LVAL(a->val) == Z_LVAL(b->val);
+		case IS_DOUBLE:
+			return memcmp(&Z_DVAL(a->val), &Z_DVAL(b->val), sizeof(double)) == 0;
+		case IS_STRING:
+		case IS_PTR: {
+			const zend_string *sb = apc_entry_str_at(b);
+			return apc_entry_str_identical(apc_entry_str_at(a), ZSTR_VAL(sb), ZSTR_LEN(sb));
+		}
+		default:
+			return 0;
+	}
 }
 
 /*

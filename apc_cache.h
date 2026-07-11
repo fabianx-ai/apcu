@@ -71,6 +71,7 @@ typedef struct _apc_cache_header_t {
 	zend_long ncleanups;            /* default expunge count */
 	zend_long ndefragmentations;    /* defragmentation count */
 	zend_long nexpunges;            /* real expunge count */
+	zend_long nskipped;             /* stores skipped because the value was identical (apcu_update) */
 	zend_long nentries;             /* entry count */
 	zend_long mem_size;             /* used */
 	time_t stime;                   /* start time */
@@ -150,6 +151,17 @@ PHP_APCU_API void apc_cache_clear(apc_cache_t* cache);
 PHP_APCU_API zend_bool apc_cache_store(
         apc_cache_t* cache, zend_string *key, const zval *val,
         const zend_long ttl, const zend_bool exclusive);
+
+/*
+ * apc_cache_store_if_changed stores val under key like apc_cache_store, except that
+ * when the cache already holds a live entry with an identical value, the store is
+ * skipped entirely: no SMA allocation and no entry replacement; only the entry's
+ * ttl/ctime/mtime/atime are refreshed. Identity detection is best-effort: false
+ * negatives merely perform an ordinary store. The skip decision is only made while
+ * holding the cache write lock. Returns true when the value was stored or skipped.
+ */
+PHP_APCU_API zend_bool apc_cache_store_if_changed(
+        apc_cache_t* cache, zend_string *key, const zval *val, const zend_long ttl);
 
 /*
  * apc_cache_update updates an entry in place. The updater function must not bailout.
