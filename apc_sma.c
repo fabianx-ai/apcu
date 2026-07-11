@@ -352,7 +352,13 @@ PHP_APCU_API zend_bool apc_sma_shared_validate(void *shmaddr, size_t size) {
 	if (info->nslots == 0 || info->nslots > size / sizeof(uintptr_t)) {
 		return 0;
 	}
-	if (info->cache_span < info->nslots * sizeof(uintptr_t)
+	/* The slots array that apc_cache_shared_adopt iterates starts at
+	 * cache_off + sizeof(apc_cache_header_t) and runs nslots*sizeof(uintptr_t)
+	 * bytes, so cache_span must cover the header AND the slots, and its end
+	 * must fall inside the segment. Requiring cache_span to include the header
+	 * (not just the slots) is what stops a crafted header from placing the
+	 * slots' end past the mapping. */
+	if (info->cache_span < sizeof(apc_cache_header_t) + info->nslots * sizeof(uintptr_t)
 			|| info->cache_span > size
 			|| info->cache_off + info->cache_span > size) {
 		return 0;
