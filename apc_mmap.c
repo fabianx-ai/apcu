@@ -172,40 +172,51 @@ static int apc_mmap_shared_lock_fd = -1;
  * only trusted users can write — but it closes the pre-creation, symlink, and
  * crafted-content classes for the recommended 0600 same-owner deployment.
  */
-static zend_bool apc_mmap_shared_fd_ok(const struct stat *st)
-{
-	return S_ISREG(st->st_mode)
-		&& (st->st_uid == geteuid() || st->st_uid == 0)
-		&& st->st_nlink == 1
-		&& !(st->st_mode & (S_IWGRP | S_IWOTH));
-}
-
-/* Fatal variant for the attach/create path, which reports a specific reason. */
-static void apc_mmap_shared_check_fd(int fd, const char *file_path, const struct stat *st)
+/* Returns NULL if the file is acceptable, else a human-readable reason. */
+static const char *apc_mmap_shared_fd_reason(const struct stat *st)
 {
 	if (!S_ISREG(st->st_mode)) {
-		close(fd);
-		zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: %s is not a regular file; refusing to use it as a shared segment", file_path);
+		return "not a regular file";
 	}
 	if (st->st_uid != geteuid() && st->st_uid != 0) {
-		close(fd);
-		zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: %s is owned by uid %d, not by this process (%d) or root; refusing to attach (possible planted file)", file_path, (int)st->st_uid, (int)geteuid());
+		return "owned by another non-root user (possible planted file)";
 	}
 	if (st->st_nlink != 1) {
-		close(fd);
-		zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: %s has %ld hard links; refusing to use it as a shared segment", file_path, (long)st->st_nlink);
+		return "has extra hard links";
 	}
 	if (st->st_mode & (S_IWGRP | S_IWOTH)) {
-		close(fd);
-		zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: %s is group/world writable; refusing to use it as a shared segment (any writer could corrupt every attached process)", file_path);
+		return "group/world writable (any writer could corrupt every attached process)";
 	}
+	return NULL;
 }
 
-void *apc_mmap_shared(char *file_path, size_t *size, zend_bool *existed)
+static zend_bool apc_mmap_shared_fd_ok(const struct stat *st)
+{
+	return apc_mmap_shared_fd_reason(st) == NULL;
+}
+
+/*
+ * Reserve backing storage so a later store cannot SIGBUS on out-of-space.
+ * Best effort: filesystems that do not support fallocate keep the sparse
+ * ftruncate behaviour; only a genuine ENOSPC is reported (returned errno).
+ */
+static int apc_mmap_reserve(int fd, size_t size)
+{
+	int rc = posix_fallocate(fd, 0, (off_t)size);
+	if (rc == EOPNOTSUPP || rc == ENOSYS || rc == EINVAL) {
+		return 0;
+	}
+	return rc;
+}
+
+void *apc_mmap_shared(char *file_path, size_t *size, zend_bool *existed, char *errbuf, size_t errlen)
 {
 	void *shmaddr;
+	const char *reason;
 	struct stat st, st_path;
 	int fd = -1, rc, attempts;
+
+	errbuf[0] = '\0';
 
 	/* A segment rotation can atomically rename() a successor over file_path
 	 * between our open() and flock(); detect that by comparing the inode we
@@ -213,7 +224,8 @@ void *apc_mmap_shared(char *file_path, size_t *size, zend_bool *existed)
 	for (attempts = 0; attempts < 5; attempts++) {
 		fd = open(file_path, APC_SHARED_OPEN_FLAGS | O_CREAT, S_IRUSR | S_IWUSR);
 		if (fd == -1) {
-			zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: open on %s failed: %s (a symlink at this path is refused)", file_path, strerror(errno));
+			snprintf(errbuf, errlen, "open on %s failed: %s (a symlink at this path is refused)", file_path, strerror(errno));
+			return NULL;
 		}
 
 		/* Serialize segment creation/attach across processes. The lock is
@@ -223,13 +235,15 @@ void *apc_mmap_shared(char *file_path, size_t *size, zend_bool *existed)
 			rc = flock(fd, LOCK_EX);
 		} while (rc == -1 && errno == EINTR);
 		if (rc == -1) {
+			snprintf(errbuf, errlen, "flock on %s failed: %s", file_path, strerror(errno));
 			close(fd);
-			zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: flock on %s failed: %s", file_path, strerror(errno));
+			return NULL;
 		}
 
 		if (fstat(fd, &st) != 0) {
+			snprintf(errbuf, errlen, "fstat on %s failed: %s", file_path, strerror(errno));
 			close(fd);
-			zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: fstat on %s failed: %s", file_path, strerror(errno));
+			return NULL;
 		}
 
 		if (stat(file_path, &st_path) == 0 && st_path.st_ino == st.st_ino) {
@@ -242,17 +256,30 @@ void *apc_mmap_shared(char *file_path, size_t *size, zend_bool *existed)
 		fd = -1;
 	}
 	if (fd == -1) {
-		zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: %s keeps changing while attaching (concurrent rotations?)", file_path);
+		snprintf(errbuf, errlen, "%s keeps changing while attaching (concurrent rotations?)", file_path);
+		return NULL;
 	}
 
-	apc_mmap_shared_check_fd(fd, file_path, &st);
+	reason = apc_mmap_shared_fd_reason(&st);
+	if (reason) {
+		snprintf(errbuf, errlen, "%s is %s; refusing to use it as a shared segment", file_path, reason);
+		close(fd);
+		return NULL;
+	}
 
 	if (st.st_size == 0) {
 		/* Fresh file: this process becomes the creator at the desired size. */
 		*existed = 0;
 		if (ftruncate(fd, *size) < 0) {
+			snprintf(errbuf, errlen, "ftruncate on %s failed: %s", file_path, strerror(errno));
 			close(fd);
-			zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: ftruncate on %s failed: %s", file_path, strerror(errno));
+			return NULL;
+		}
+		rc = apc_mmap_reserve(fd, *size);
+		if (rc != 0) {
+			snprintf(errbuf, errlen, "cannot reserve %zu bytes for %s: %s", *size, file_path, strerror(rc));
+			close(fd);
+			return NULL;
 		}
 	} else {
 		/* Existing segment: map it at its own size. A rotation may have
@@ -264,8 +291,9 @@ void *apc_mmap_shared(char *file_path, size_t *size, zend_bool *existed)
 
 	shmaddr = mmap(NULL, *size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NOSYNC, fd, 0);
 	if (shmaddr == MAP_FAILED) {
+		snprintf(errbuf, errlen, "failed to mmap %zu bytes of %s (apc.shm_size may be too large)", *size, file_path);
 		close(fd);
-		zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: failed to mmap %zu bytes of %s. apc.shm_size may be too large.", *size, file_path);
+		return NULL;
 	}
 
 	apc_mmap_shared_lock_fd = fd;
@@ -361,7 +389,7 @@ void *apc_mmap_file_create(char *file_path, size_t size)
 	if (fd == -1) {
 		return NULL;
 	}
-	if (ftruncate(fd, size) < 0) {
+	if (ftruncate(fd, size) < 0 || apc_mmap_reserve(fd, size) != 0) {
 		close(fd);
 		unlink(file_path);
 		return NULL;

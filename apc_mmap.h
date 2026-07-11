@@ -50,7 +50,7 @@ void apc_unmap(void *shmaddr, size_t size);
  * when a non-empty file was already present (attach candidate), 0 when this
  * process created the file and must initialize the segment.
  */
-void *apc_mmap_shared(char *file_path, size_t *size, zend_bool *existed);
+void *apc_mmap_shared(char *file_path, size_t *size, zend_bool *existed, char *errbuf, size_t errlen);
 void apc_mmap_shared_release_lock(void);
 
 /* Rotation support: map the current segment file as-is / build a successor. */
