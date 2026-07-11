@@ -374,6 +374,10 @@ static PHP_RINIT_FUNCTION(apcu)
 #endif
 
 	APCG(request_time) = 0;
+	/* Iterators never span requests; reset the pin counter so a leaked
+	 * iterator in one request cannot permanently refuse segment rotation for
+	 * the life of the process. */
+	APCG(iterator_level) = 0;
 	if (APCG(enabled)) {
 		/* Follow a segment rotation performed by another process. */
 		apc_shared_segment_refresh();
