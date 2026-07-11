@@ -53,7 +53,7 @@ typedef zend_bool (*apc_sma_expunge_f)(void *pointer, size_t size);
 
 /* maximum stored length (incl. NUL) of the serializer name recorded in a
  * file-backed shared segment for cross-process validation */
-#define APC_SHARED_SEG_SERIALIZER_LEN 16
+#define APC_SHARED_SEG_SERIALIZER_LEN 32
 
 typedef struct _apc_sma_t {
 	zend_bool initialized;         /* flag to indicate this sma has been initialized */

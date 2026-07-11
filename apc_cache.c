@@ -472,6 +472,7 @@ PHP_APCU_API size_t apc_cache_shared_migrate(apc_cache_t *old_cache, apc_cache_t
 			apc_cache_wlocked_link_entry(new_cache, &new_cache->slots[s], copy);
 			new_cache->header->mem_size += copy->mem_size;
 			new_cache->header->nentries++;
+			new_cache->header->ninserts++;
 			migrated++;
 		}
 	}

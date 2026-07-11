@@ -218,6 +218,13 @@ void *apc_mmap_shared(char *file_path, size_t *size, zend_bool *existed, char *e
 
 	errbuf[0] = '\0';
 
+	/* Defensive: APCu only ever sets up one shared segment, so a lingering
+	 * lock fd here would be a bug; close it rather than leak the fd + flock. */
+	if (apc_mmap_shared_lock_fd != -1) {
+		close(apc_mmap_shared_lock_fd);
+		apc_mmap_shared_lock_fd = -1;
+	}
+
 	/* A segment rotation can atomically rename() a successor over file_path
 	 * between our open() and flock(); detect that by comparing the inode we
 	 * locked with the inode currently at the path, and retry. */

@@ -280,6 +280,10 @@ static PHP_MINIT_FUNCTION(apcu)
 			mmap_file_mask = APCG(mmap_file_mask);
 			mmap_shared_file = APCG(mmap_shared_file);
 			mmap_hugepage_size = APCG(mmap_hugepage_size);
+
+			if (mmap_shared_file && *mmap_shared_file && mmap_file_mask && *mmap_file_mask) {
+				apc_warning("apc.mmap_shared_file is set, so apc.mmap_file_mask is ignored");
+			}
 #endif
 
 			/* ensure this runs only once */

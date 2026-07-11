@@ -150,6 +150,14 @@ static uint64_t apc_sma_generate_seg_id(void) {
 	return id ? id : 1;
 }
 
+/* Usable allocation ceiling of a segment of the given total size: the segment
+ * minus the SMA header and the three bookkeeping blocks (first sentinel, the
+ * single free block's header, last sentinel). Kept in one place so the attach,
+ * swap and init paths cannot drift. */
+static inline size_t apc_sma_max_alloc_for(size_t size) {
+	return size - ALIGNWORD(sizeof(sma_header_t)) - 3 * ALIGNWORD(sizeof(block_t));
+}
+
 /* macros for getting the next or previous sequential block */
 #define NEXT_SBLOCK(block) ((block_t*)((char*)block + block->size))
 #define PREV_SBLOCK(block) ((block_t*)((char*)block - block->prev_size))
@@ -378,7 +386,7 @@ PHP_APCU_API void apc_sma_init_segment(apc_sma_t *sma, size_t min_alloc_size) {
 	SMA_CREATE_LOCK(&smaheader->sma_lock);
 	smaheader->min_block_size = min_alloc_size > 0 ? ALIGNWORD(min_alloc_size + ALIGNWORD(sizeof(block_t))) : MINBLOCKSIZE;
 	smaheader->avail = sma->size - ALIGNWORD(sizeof(sma_header_t)) - ALIGNWORD(sizeof(block_t)) - ALIGNWORD(sizeof(block_t));
-	sma->max_alloc_size = smaheader->avail - ALIGNWORD(sizeof(block_t));
+	sma->max_alloc_size = apc_sma_max_alloc_for(sma->size);
 
 	block_t *first = BLOCKAT(ALIGNWORD(sizeof(sma_header_t)));
 	first->size = 0;
@@ -467,9 +475,7 @@ PHP_APCU_API void apc_sma_init(apc_sma_t* sma, void** data, apc_sma_expunge_f ex
 						sma->size = mapped_size;
 						/* Recompute max_alloc_size exactly as the creator did
 						 * from the initial avail; header->avail changed since. */
-						sma->max_alloc_size = sma->size
-							- ALIGNWORD(sizeof(sma_header_t))
-							- 3 * ALIGNWORD(sizeof(block_t));
+						sma->max_alloc_size = apc_sma_max_alloc_for(sma->size);
 						sma->shared_attached = 1;
 						sma->shared_seg_id = info->seg_id;
 						return;
@@ -584,16 +590,18 @@ PHP_APCU_API void apc_sma_shared_retire(apc_sma_t *sma) {
 	/* Guarded by the rotating process's flock on the segment file, not by
 	 * the cache lock: retirement must work even when the cache lock is
 	 * wedged by a crashed process. Attached processes poll this flag at
-	 * request start and re-attach to the successor segment. */
+	 * request start and re-attach to the successor segment. The full barrier
+	 * ensures the flag store is visible after the rename() that published the
+	 * successor on weakly-ordered architectures (readers self-heal, so a plain
+	 * relaxed load on the poll side is fine). */
 	((sma_header_t *)sma->shmaddr)->shared_info.retired = 1;
+	__sync_synchronize();
 }
 
 PHP_APCU_API void apc_sma_shared_swap(apc_sma_t *sma, void *new_addr, size_t new_size) {
 	sma->shmaddr = new_addr;
 	sma->size = new_size;
-	sma->max_alloc_size = new_size
-		- ALIGNWORD(sizeof(sma_header_t))
-		- 3 * ALIGNWORD(sizeof(block_t));
+	sma->max_alloc_size = apc_sma_max_alloc_for(new_size);
 	sma->shared_attached = 1;
 	sma->shared_seg_id = ((sma_header_t *)new_addr)->shared_info.seg_id;
 }
