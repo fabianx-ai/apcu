@@ -453,15 +453,19 @@ typedef enum {
 	APC_STORE_MODE_STORE,  /* apcu_store: always store */
 	APC_STORE_MODE_ADD,    /* apcu_add: store only if no live entry exists */
 	APC_STORE_MODE_UPDATE, /* apcu_update: store unless the stored value is identical */
+	APC_STORE_MODE_ADD_EI, /* apcu_add_ei: store unless the identifier already matches */
 } apc_store_mode_t;
 
-static zend_bool apc_store_helper_one(zend_string *key, zval *val, zend_long ttl, apc_store_mode_t mode)
+static zend_bool apc_store_helper_one(
+		zend_string *key, zval *val, zend_long ttl, apc_store_mode_t mode, zend_string *ei)
 {
 	switch (mode) {
 		case APC_STORE_MODE_ADD:
 			return apc_cache_store(apc_user_cache, key, val, ttl, 1);
 		case APC_STORE_MODE_UPDATE:
 			return apc_cache_store_if_changed(apc_user_cache, key, val, ttl);
+		case APC_STORE_MODE_ADD_EI:
+			return apc_cache_add_ei(apc_user_cache, key, ei, val, ttl);
 		default:
 			return apc_cache_store(apc_user_cache, key, val, ttl, 0);
 	}
@@ -470,15 +474,37 @@ static zend_bool apc_store_helper_one(zend_string *key, zval *val, zend_long ttl
 static void apc_store_helper(INTERNAL_FUNCTION_PARAMETERS, const apc_store_mode_t mode)
 {
 	zval *key;
+	zval *ei_zv = NULL;
 	zval *val = NULL;
 	zend_long ttl = 0L;
+	zend_string *ei = NULL;
 
-	ZEND_PARSE_PARAMETERS_START(1, 3)
-		Z_PARAM_ZVAL(key)
-		Z_PARAM_OPTIONAL
-		Z_PARAM_ZVAL(val)
-		Z_PARAM_LONG(ttl)
-	ZEND_PARSE_PARAMETERS_END();
+	if (mode == APC_STORE_MODE_ADD_EI) {
+		ZEND_PARSE_PARAMETERS_START(2, 4)
+			Z_PARAM_ZVAL(key)
+			Z_PARAM_ZVAL(ei_zv)
+			Z_PARAM_OPTIONAL
+			Z_PARAM_ZVAL(val)
+			Z_PARAM_LONG(ttl)
+		ZEND_PARSE_PARAMETERS_END();
+
+		ZVAL_DEREF(ei_zv);
+		if (Z_TYPE_P(ei_zv) == IS_STRING) {
+			ei = zend_string_copy(Z_STR_P(ei_zv));
+		} else if (Z_TYPE_P(ei_zv) == IS_LONG) {
+			ei = zend_long_to_str(Z_LVAL_P(ei_zv));
+		} else {
+			apc_warning("apcu_add_ei expects the expiration identifier to be a string or an integer.");
+			RETURN_FALSE;
+		}
+	} else {
+		ZEND_PARSE_PARAMETERS_START(1, 3)
+			Z_PARAM_ZVAL(key)
+			Z_PARAM_OPTIONAL
+			Z_PARAM_ZVAL(val)
+			Z_PARAM_LONG(ttl)
+		ZEND_PARSE_PARAMETERS_END();
+	}
 
 	if (APCG(serializer_name)) {
 		/* Avoid race conditions between MINIT of apc and serializer exts like igbinary */
@@ -504,22 +530,25 @@ static void apc_store_helper(INTERNAL_FUNCTION_PARAMETERS, const apc_store_mode_
 			} else {
 				hkey = zend_long_to_str(hkey_idx);
 			}
-			if (!apc_store_helper_one(hkey, hentry, ttl, mode)) {
+			if (!apc_store_helper_one(hkey, hentry, ttl, mode, ei)) {
 				zend_symtable_add_new(Z_ARRVAL_P(return_value), hkey, &fail_zv);
 			}
 			zend_string_release(hkey);
 		} ZEND_HASH_FOREACH_END();
-		return;
 	} else if (Z_TYPE_P(key) == IS_STRING) {
 		if (!val) {
 			/* nothing to store */
-			RETURN_FALSE;
+			RETVAL_FALSE;
+		} else {
+			RETVAL_BOOL(apc_store_helper_one(Z_STR_P(key), val, ttl, mode, ei));
 		}
-
-		RETURN_BOOL(apc_store_helper_one(Z_STR_P(key), val, ttl, mode));
 	} else {
 		apc_warning("apc_store expects key parameter to be a string or an array of key/value pairs.");
-		RETURN_FALSE;
+		RETVAL_FALSE;
+	}
+
+	if (ei) {
+		zend_string_release(ei);
 	}
 }
 
@@ -545,6 +574,12 @@ PHP_FUNCTION(apcu_add) {
    Store like apcu_store, but skip the write when the stored value is identical (GH #355) */
 PHP_FUNCTION(apcu_update) {
 	apc_store_helper(INTERNAL_FUNCTION_PARAM_PASSTHRU, APC_STORE_MODE_UPDATE);
+}
+
+/* proto int apcu_add_ei(mixed key, string|int expiration_identifier, mixed var [, long ttl ])
+   Store tagged with an expiration identifier, unless the stored identifier already matches (GH #356) */
+PHP_FUNCTION(apcu_add_ei) {
+	apc_store_helper(INTERNAL_FUNCTION_PARAM_PASSTHRU, APC_STORE_MODE_ADD_EI);
 }
 
 struct php_inc_updater_args {

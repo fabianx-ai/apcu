@@ -60,7 +60,7 @@ apc_cache_entry_t *apc_persist(
 		apc_sma_t *sma, apc_serializer_t *serializer, zend_string *key, const zval *val);
 apc_cache_entry_t *apc_persist_ex(
 		apc_sma_t *sma, apc_serializer_t *serializer, zend_string *key, const zval *val,
-		unsigned char *serialized_str, size_t serialized_str_len);
+		unsigned char *serialized_str, size_t serialized_str_len, zend_string *ei);
 zend_bool apc_persist_serialize_value(
 		apc_serializer_t *serializer, const zval *zv,
 		unsigned char **buf, size_t *buf_len);
@@ -69,6 +69,8 @@ zend_bool apc_entry_value_identical(
 		const unsigned char *serialized_str, size_t serialized_str_len);
 zend_bool apc_entry_payloads_identical(
 		const apc_cache_entry_t *a, const apc_cache_entry_t *b);
+zend_bool apc_entry_ei_matches(const apc_cache_entry_t *entry, const zend_string *ei);
+zend_string *apc_entry_fetch_ei(const apc_cache_entry_t *entry);
 zend_bool apc_unpersist(zval *dst, const apc_cache_entry_t *entry, apc_serializer_t *serializer);
 
 /* make_prime */
@@ -397,19 +399,32 @@ static inline zend_bool apc_cache_wlocked_insert(
 			}
 
 			/*
-			 * apc_cache_store_if_changed: if the live entry's value is identical
-			 * to the new one, refresh its metadata instead of replacing it. The
+			 * Skip-aware inserts re-check identity under the write lock; the
 			 * caller frees the unused new entry.
 			 */
-			if (skipped && !apc_cache_entry_hard_expired(entry, t)
-					&& apc_entry_payloads_identical(entry, new_entry)) {
-				entry->ttl = new_entry->ttl;
-				entry->ctime = new_entry->ctime;
-				entry->mtime = new_entry->mtime;
-				entry->atime = new_entry->atime;
-				cache->header->nskipped++;
-				*skipped = 1;
-				return 1;
+			if (skipped && !apc_cache_entry_hard_expired(entry, t)) {
+				if (new_entry->ei) {
+					/* apc_cache_add_ei: a live entry with a matching expiration
+					 * identifier is left completely untouched, add-style. */
+					const zend_string *new_ei =
+						(const zend_string *)((const char *) new_entry + new_entry->ei);
+
+					if (apc_entry_ei_matches(entry, new_ei)) {
+						cache->header->nskipped++;
+						*skipped = 1;
+						return 1;
+					}
+				} else if (apc_entry_payloads_identical(entry, new_entry)) {
+					/* apc_cache_store_if_changed: an identical value has its
+					 * metadata refreshed as a store would. */
+					entry->ttl = new_entry->ttl;
+					entry->ctime = new_entry->ctime;
+					entry->mtime = new_entry->mtime;
+					entry->atime = new_entry->atime;
+					cache->header->nskipped++;
+					*skipped = 1;
+					return 1;
+				}
 			}
 
 			apc_cache_wlocked_remove_entry(cache, entry);
@@ -683,7 +698,7 @@ PHP_APCU_API zend_bool apc_cache_store_if_changed(
 
 	/* create entry in the shared memory (takes ownership of serialized_str) */
 	entry = apc_persist_ex(
-		cache->sma, cache->serializer, key, val, serialized_str, serialized_str_len);
+		cache->sma, cache->serializer, key, val, serialized_str, serialized_str_len, NULL);
 	if (!entry) {
 		return 0;
 	}
@@ -714,6 +729,73 @@ PHP_APCU_API zend_bool apc_cache_store_if_changed(
 	} php_apc_end_try();
 
 	return ret;
+}
+
+PHP_APCU_API zend_bool apc_cache_add_ei(
+		apc_cache_t *cache, zend_string *key, zend_string *ei, const zval *val,
+		const zend_long ttl) {
+	time_t t = apc_time();
+	zend_bool skipped = 0;
+	zend_bool ret = 0;
+	apc_cache_entry_t *entry;
+
+	if (!cache) {
+		return 0;
+	}
+
+	/* Fast path: when the live entry's identifier already matches, nothing is
+	 * written and nothing is serialized — the write lock is held only for the
+	 * identifier comparison. */
+	if (!apc_cache_wlock(cache)) {
+		return 0;
+	}
+
+	entry = apc_cache_rlocked_find_nostat(cache, key, t);
+	if (entry && apc_entry_ei_matches(entry, ei)) {
+		cache->header->nskipped++;
+		apc_cache_wunlock(cache);
+		return 0;
+	}
+	apc_cache_wunlock(cache);
+
+	/* run cache defense */
+	if (apc_cache_defense(cache, key, t)) {
+		return 0;
+	}
+
+	/* create entry in the shared memory, tagged with the identifier */
+	entry = apc_persist_ex(cache->sma, cache->serializer, key, val, NULL, 0, ei);
+	if (!entry) {
+		return 0;
+	}
+
+	/* init remaining values of the entry */
+	apc_cache_set_entry_values(entry, ttl, t);
+
+	if (!apc_cache_wlock(cache)) {
+		free_entry(cache, entry);
+		return 0;
+	}
+
+	php_apc_try {
+		/* A concurrent writer may have stored the same identifier since the
+		 * check above; the insert re-checks under the lock before replacing. */
+		ret = apc_cache_wlocked_insert(cache, entry, 0, &skipped);
+	} php_apc_finally {
+		apc_cache_wunlock(cache);
+
+		if (ret && !skipped) {
+			/* release entry, because the ref_count of a new entry is initialized to 1 during allocation */
+			apc_cache_entry_release(cache, entry);
+		} else {
+			/* unused (skipped) or failed candidate; it was never linked, so free it.
+			 * It mustn't be released first, to prevent defragmentation from moving it. */
+			free_entry(cache, entry);
+		}
+	} php_apc_end_try();
+
+	/* add semantics: a skip means the identifier was already present */
+	return ret && !skipped;
 }
 
 #ifndef ZTS
@@ -1332,6 +1414,10 @@ PHP_APCU_API void apc_cache_stat(apc_cache_t *cache, zend_string *key, zval *sta
 				array_add_long(stat, apc_str_deletion_time, entry->dtime);
 				array_add_long(stat, apc_str_ttl, entry->ttl);
 				array_add_long(stat, apc_str_refs, entry->ref_count);
+				if (entry->ei) {
+					zend_string *ei = apc_entry_fetch_ei(entry);
+					add_assoc_str(stat, "expiration_identifier", ei);
+				}
 				break;
 			}
 

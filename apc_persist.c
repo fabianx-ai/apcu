@@ -53,6 +53,8 @@ typedef struct _apc_persist_context_t {
 	/* Serialized object/array string, in case there can only be one */
 	unsigned char *serialized_str;
 	size_t serialized_str_len;
+	/* Expiration identifier to store with the entry (apcu_add_ei), if any */
+	zend_string *ei;
 	/* Address (process local) of entry in shm / Whole SMA allocation */
 	char *alloc;
 	/* Current position in allocation */
@@ -106,6 +108,7 @@ static void apc_persist_init_context(apc_persist_context_t *ctxt, apc_serializer
 	ctxt->use_serialization = 0;
 	ctxt->serialized_str = NULL;
 	ctxt->serialized_str_len = 0;
+	ctxt->ei = NULL;
 	ctxt->alloc = NULL;
 	ctxt->alloc_cur = NULL;
 }
@@ -261,6 +264,10 @@ static zend_bool apc_persist_calc_zval(apc_persist_context_t *ctxt, const zval *
 
 static zend_bool apc_persist_calc(apc_persist_context_t *ctxt, const zend_string *key, const zval *zv) {
 	ADD_SIZE(APC_ENTRY_SIZE(ZSTR_LEN(key)));
+
+	if (ctxt->ei) {
+		ADD_SIZE_STR(ZSTR_LEN(ctxt->ei));
+	}
 
 	return apc_persist_calc_zval(ctxt, zv);
 }
@@ -483,6 +490,14 @@ static apc_cache_entry_t *apc_persist_create_entry(
 	ZVAL_COPY_VALUE(&entry->val, zv);
 	apc_persist_copy_zval(ctxt, &entry->val);
 
+	/* Deep copy of the expiration identifier, if any */
+	if (ctxt->ei) {
+		zend_string *ei = apc_persist_copy_zstr_no_add(ctxt, ctxt->ei);
+		entry->ei = (uintptr_t) TO_OFF(ei);
+	} else {
+		entry->ei = 0;
+	}
+
 	return entry;
 }
 
@@ -495,11 +510,12 @@ static void apc_persist_sma_init_entry(apc_cache_entry_t *entry) {
 
 apc_cache_entry_t *apc_persist_ex(
 		apc_sma_t *sma, apc_serializer_t *serializer, zend_string *key, const zval *val,
-		unsigned char *serialized_str, size_t serialized_str_len) {
+		unsigned char *serialized_str, size_t serialized_str_len, zend_string *ei) {
 	apc_persist_context_t ctxt;
 	apc_cache_entry_t *entry;
 
 	apc_persist_init_context(&ctxt, serializer);
+	ctxt.ei = ei;
 
 	/* The top-level value should never be a reference */
 	ZEND_ASSERT(Z_TYPE_P(val) != IS_REFERENCE);
@@ -562,7 +578,7 @@ apc_cache_entry_t *apc_persist_ex(
 
 apc_cache_entry_t *apc_persist(
 		apc_sma_t *sma, apc_serializer_t *serializer, zend_string *key, const zval *val) {
-	return apc_persist_ex(sma, serializer, key, val, NULL, 0);
+	return apc_persist_ex(sma, serializer, key, val, NULL, 0, NULL);
 }
 
 /*
@@ -613,6 +629,31 @@ zend_bool apc_entry_value_identical(
 		default:
 			return 0;
 	}
+}
+
+/* Compare a stored entry's expiration identifier against a request-local one.
+ * Entries stored without an identifier never match. */
+zend_bool apc_entry_ei_matches(const apc_cache_entry_t *entry, const zend_string *ei) {
+	const zend_string *stored;
+
+	if (!entry->ei) {
+		return 0;
+	}
+
+	stored = (const zend_string *)((const char *) entry + entry->ei);
+	return apc_entry_str_identical(stored, ZSTR_VAL(ei), ZSTR_LEN(ei));
+}
+
+/* Fetch a request-local copy of an entry's expiration identifier, or NULL. */
+zend_string *apc_entry_fetch_ei(const apc_cache_entry_t *entry) {
+	const zend_string *stored;
+
+	if (!entry->ei) {
+		return NULL;
+	}
+
+	stored = (const zend_string *)((const char *) entry + entry->ei);
+	return zend_string_init(ZSTR_VAL(stored), ZSTR_LEN(stored), 0);
 }
 
 /* Compare the value payloads of two persisted entries. Structurally persisted

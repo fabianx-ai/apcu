@@ -24,6 +24,12 @@ function apcu_add($key, mixed $value = UNKNOWN, int $ttl = 0): array|bool {}
 /** @param array|string $key */
 function apcu_update($key, mixed $value = UNKNOWN, int $ttl = 0): array|bool {}
 
+/**
+ * @param array|string $key
+ * @param string|int $expiration_identifier
+ */
+function apcu_add_ei($key, $expiration_identifier, mixed $value = UNKNOWN, int $ttl = 0): array|bool {}
+
 /** @param bool $success */
 function apcu_inc(string $key, int $step = 1, &$success = null, int $ttl = 0): int|false {}
 

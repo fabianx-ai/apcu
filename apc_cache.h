@@ -58,6 +58,7 @@ struct apc_cache_entry_t {
 	time_t dtime;            /* time entry was removed from cache */
 	time_t atime;            /* time entry was last accessed */
 	zend_long mem_size;      /* memory used */
+	uintptr_t ei;            /* offset to the expiration identifier string, 0 if none */
 	zval val;                /* the zval copied at store time */
 	zend_string key;         /* entry key (MUST BE THE LAST FIELD OF THE STRUCT!) */
 };
@@ -162,6 +163,19 @@ PHP_APCU_API zend_bool apc_cache_store(
  */
 PHP_APCU_API zend_bool apc_cache_store_if_changed(
         apc_cache_t* cache, zend_string *key, const zval *val, const zend_long ttl);
+
+/*
+ * apc_cache_add_ei stores val under key tagged with the expiration identifier ei,
+ * unless the cache already holds a live entry for key whose identifier is identical —
+ * then nothing is written or refreshed and 0 is returned (add semantics, like
+ * apc_cache_store with exclusive on an existing key). Entries stored without an
+ * identifier never match and are replaced. The match decision is only made while
+ * holding the cache write lock; no serialization or allocation happens on a match.
+ * Returns true only when the value was stored.
+ */
+PHP_APCU_API zend_bool apc_cache_add_ei(
+        apc_cache_t* cache, zend_string *key, zend_string *ei, const zval *val,
+        const zend_long ttl);
 
 /*
  * apc_cache_update updates an entry in place. The updater function must not bailout.
