@@ -452,46 +452,63 @@ PHP_APCU_API void apc_sma_init(apc_sma_t* sma, void** data, apc_sma_expunge_f ex
 			/* An existing segment is mapped and adopted at its own size (a
 			 * rotation may have resized it); apc.shm_size only applies when
 			 * this process creates the segment. */
+			char err[256] = "";
 			size_t mapped_size = sma->size;
-			sma->shmaddr = apc_mmap_shared(shared_file, &mapped_size, &existed);
+			sma->shmaddr = apc_mmap_shared(shared_file, &mapped_size, &existed, err, sizeof(err));
 
-			if (existed) {
+			if (sma->shmaddr && existed) {
 				sma_header_t *smaheader = sma->shmaddr;
 				apc_shared_seg_info_t *info = &smaheader->shared_info;
 
 				if (info->magic == APC_SHARED_SEG_MAGIC) {
 					/* Fully initialized segment from another process: validate
 					 * compatibility, then attach without touching shm state. */
-					if (!apc_sma_shared_validate(sma->shmaddr, mapped_size)) {
-						zend_error_noreturn(E_CORE_ERROR,
-							"apc.mmap_shared_file: existing segment in %s is incompatible "
-							"(created by PHP version id %u with segment size %zu); "
-							"remove the file or align the PHP version across processes",
-							shared_file, info->php_version_id, info->segsize);
+					if (apc_sma_shared_validate(sma->shmaddr, mapped_size)) {
+						sma->size = mapped_size;
+						/* Recompute max_alloc_size exactly as the creator did
+						 * from the initial avail; header->avail changed since. */
+						sma->max_alloc_size = sma->size
+							- ALIGNWORD(sizeof(sma_header_t))
+							- 3 * ALIGNWORD(sizeof(block_t));
+						sma->shared_attached = 1;
+						sma->shared_seg_id = info->seg_id;
+						return;
 					}
-
-					sma->size = mapped_size;
-					/* Recompute max_alloc_size exactly as the creator did from
-					 * the initial avail; header->avail has changed since. */
-					sma->max_alloc_size = sma->size
-						- ALIGNWORD(sizeof(sma_header_t))
-						- 3 * ALIGNWORD(sizeof(block_t));
-					sma->shared_attached = 1;
-					sma->shared_seg_id = info->seg_id;
-					return;
-				}
-
-				if (mapped_size != sma->size) {
+					snprintf(err, sizeof(err),
+						"existing segment in %s is incompatible (created by PHP version id %u, segment size %zu); remove the file or align the PHP version/build across processes",
+						shared_file, info->php_version_id, info->segsize);
+					apc_mmap_shared_release_lock();
+					apc_unmap(sma->shmaddr, mapped_size);
+					sma->shmaddr = NULL;
+				} else if (mapped_size != sma->size) {
 					/* A file this process didn't size, without a valid segment
 					 * in it: refuse to clobber what we cannot identify. */
-					zend_error_noreturn(E_CORE_ERROR,
-						"apc.mmap_shared_file: %s has size %zu, contains no valid segment, "
-						"and does not match apc.shm_size (%zu); remove the file manually",
+					snprintf(err, sizeof(err),
+						"%s has size %zu, contains no valid segment, and does not match apc.shm_size (%zu); remove the file manually",
 						shared_file, mapped_size, sma->size);
+					apc_mmap_shared_release_lock();
+					apc_unmap(sma->shmaddr, mapped_size);
+					sma->shmaddr = NULL;
 				}
-				/* Sized file without the ready-magic: a previous initialization
-				 * crashed midway (the flock we hold proves no live process is
-				 * initializing it). Fall through and re-initialize. */
+				/* else: sized file without the ready-magic — a previous
+				 * initialization crashed midway (the flock we hold proves no
+				 * live process is initializing it); fall through and
+				 * re-initialize as the creator. */
+			}
+
+			if (!sma->shmaddr) {
+				/* Operational failure (permission, incompatible/foreign file,
+				 * out of space, ...). By default this is fatal; with
+				 * apc.mmap_shared_file_fallback the process degrades to a
+				 * private, unshared segment with a warning instead of failing
+				 * to start. */
+				if (!APCG(mmap_shared_file_fallback)) {
+					zend_error_noreturn(E_CORE_ERROR, "apc.mmap_shared_file: %s", err);
+				}
+				apc_warning("apc.mmap_shared_file: %s; falling back to a private (unshared) segment", err);
+				sma->shared_mode = 0;
+				sma->shared_attached = 0;
+				sma->shmaddr = apc_mmap(mask, sma->size, hugepage_size);
 			}
 		}
 	} else {

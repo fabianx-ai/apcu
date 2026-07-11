@@ -46,6 +46,7 @@ ZEND_BEGIN_MODULE_GLOBALS(apcu)
 #ifdef APC_MMAP
 	char *mmap_file_mask;         /* mktemp-style file-mask to pass to mmap */
 	char *mmap_shared_file;       /* fixed path of a file-backed segment shared across unrelated processes */
+	zend_bool mmap_shared_file_fallback; /* on operational failure, fall back to a private segment instead of failing to start */
 	zend_long mmap_hugepage_size; /* hugepage size flag to pass to mmap (0: none)*/
 #endif
 
@@ -63,6 +64,7 @@ ZEND_BEGIN_MODULE_GLOBALS(apcu)
 
 	/* Nesting level of apcu_entry calls. */
 	unsigned int entry_level;
+	unsigned int iterator_level; /* live APCUIterator objects pinning shm entries this request */
 ZEND_END_MODULE_GLOBALS(apcu)
 
 /* (the following is defined in php_apc.c) */

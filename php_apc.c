@@ -86,6 +86,7 @@ static void php_apc_init_globals(zend_apcu_globals* apcu_globals)
 	apcu_globals->use_request_time = 0;
 	apcu_globals->serializer_name = NULL;
 	apcu_globals->entry_level = 0;
+	apcu_globals->iterator_level = 0;
 }
 
 /* PHP_INI */
@@ -164,6 +165,7 @@ STD_PHP_INI_ENTRY("apc.expunge_threshold", "0.5", PHP_INI_SYSTEM, OnUpdateExpung
 #ifdef APC_MMAP
 STD_PHP_INI_ENTRY("apc.mmap_file_mask", NULL,   PHP_INI_SYSTEM, OnUpdateString,            mmap_file_mask,    zend_apcu_globals, apcu_globals)
 STD_PHP_INI_ENTRY("apc.mmap_shared_file", NULL, PHP_INI_SYSTEM, OnUpdateString,            mmap_shared_file,  zend_apcu_globals, apcu_globals)
+STD_PHP_INI_BOOLEAN("apc.mmap_shared_file_fallback", "0", PHP_INI_SYSTEM, OnUpdateBool,     mmap_shared_file_fallback, zend_apcu_globals, apcu_globals)
 STD_PHP_INI_ENTRY("apc.mmap_hugepage_size", "0", PHP_INI_SYSTEM, OnUpdateMmapHugepageSize, mmap_hugepage_size, zend_apcu_globals, apcu_globals)
 #endif
 STD_PHP_INI_BOOLEAN("apc.enable_cli",   "0",    PHP_INI_SYSTEM, OnUpdateBool,              enable_cli,       zend_apcu_globals, apcu_globals)
@@ -196,6 +198,17 @@ static PHP_MINFO_FUNCTION(apcu)
 		php_info_print_table_row(2, "MMAP Shared File", APCG(mmap_shared_file));
 		php_info_print_table_row(2, "MMAP Shared Segment",
 			apc_sma_shared_attached(&apc_sma) ? "Attached" : "Created");
+		if (apc_sma.shared_mode) {
+			char buf[32];
+			/* A retired mapping means a rotation replaced the segment but this
+			 * process has not re-attached yet (it will at the next request, or
+			 * is stuck if the successor cannot be mapped — operator signal). */
+			php_info_print_table_row(2, "MMAP Shared Segment State",
+				apc_sma_shared_is_retired(&apc_sma) ? "Retired (stale — re-attach pending)" : "Current");
+			snprintf(buf, sizeof(buf), "%016llx",
+				(unsigned long long) apc_sma_shared_current_seg_id(&apc_sma));
+			php_info_print_table_row(2, "MMAP Shared Segment Id", buf);
+		}
 	}
 #else
 	php_info_print_table_row(2, "MMAP Support", "Disabled");
@@ -434,6 +447,10 @@ static zend_bool apc_shared_segment_refresh(void)
 		apc_unmap(old_addr, old_size);
 		return 1;
 	}
+
+	/* Exhausted the retry budget under a rotation storm: stay on the retired
+	 * segment rather than silently believing we converged. */
+	apc_warning("apcu: shared segment at %s kept rotating while re-attaching; still using the retired segment", path);
 #endif
 	return 0;
 }
@@ -475,6 +492,12 @@ PHP_FUNCTION(apcu_rotate_segment)
 		 * under it would self-deadlock and swapping the mapping would make
 		 * the epilogue unlock the wrong segment's lock. */
 		php_error_docref(NULL, E_WARNING, "apcu_rotate_segment cannot be called inside apcu_entry()");
+		RETURN_FALSE;
+	}
+	if (APCG(iterator_level) > 0) {
+		/* a live APCUIterator holds raw pointers into the current segment;
+		 * unmapping it on the swap below would dangle them */
+		php_error_docref(NULL, E_WARNING, "apcu_rotate_segment cannot be called while an APCUIterator is active");
 		RETURN_FALSE;
 	}
 
@@ -631,6 +654,11 @@ PHP_FUNCTION(apcu_segment_refresh)
 		/* swapping the mapping under apcu_entry() would make its epilogue
 		 * unlock the wrong segment's lock */
 		php_error_docref(NULL, E_WARNING, "apcu_segment_refresh cannot be called inside apcu_entry()");
+		RETURN_FALSE;
+	}
+	if (APCG(iterator_level) > 0) {
+		/* a live APCUIterator holds raw pointers into the current segment */
+		php_error_docref(NULL, E_WARNING, "apcu_segment_refresh cannot be called while an APCUIterator is active");
 		RETURN_FALSE;
 	}
 	apc_shared_segment_refresh();
