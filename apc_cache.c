@@ -439,7 +439,13 @@ PHP_APCU_API size_t apc_cache_shared_migrate(apc_cache_t *old_cache, apc_cache_t
 				goto done;
 			}
 			memcpy(copy, entry, entry->mem_size);
-			copy->ref_count = 1;
+			/* The copy starts with no references: the successor segment is
+			 * private to this process until rotation publishes it, so the
+			 * pin-during-allocation rationale of the store path (which sets
+			 * ref_count = 1 and releases after insertion) does not apply.
+			 * A leftover reference would pin the entry forever: it could
+			 * never be freed on removal, only parked on the GC list. */
+			copy->ref_count = 0;
 			copy->dtime = 0;
 			copy->nhits = 0;
 
