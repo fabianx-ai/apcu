@@ -16,6 +16,9 @@ Documentation
 
 APCu documentation can be found on [php.net](http://php.net/apcu).
 
+Sharing one segment between CLI and web processes, and live segment rotation,
+are documented in [SHARED_SEGMENT.md](SHARED_SEGMENT.md).
+
 Reporting Bugs
 =============
 

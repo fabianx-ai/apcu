@@ -1,0 +1,13 @@
+APCu NEWS
+
+(unreleased)
+- Added apc.mmap_shared_file: back the APCu segment with a fixed-path file so
+  unrelated processes (CLI and web SAPIs) share one user cache. See
+  SHARED_SEGMENT.md.
+- Added apcu_rotate_segment() and apcu_segment_refresh() for live segment
+  rotation and resizing, with automatic re-attach.
+- Added apc.mmap_shared_file_fallback to degrade to a private segment instead
+  of aborting startup on an operational shared-segment failure.
+- Fixed apc_unpersist_ht() to re-resolve the HashTable destructor locally, so
+  entries stored by one binary can be safely read by another (required for
+  cross-process sharing; harmless under the previous fork-only model).
