@@ -98,11 +98,32 @@ struct block_t {
 #define BLOCKAT(offset) ((block_t*)((char *)smaheader + offset))
 #define OFFSET(block) ((size_t)(((char*)block) - (char*)smaheader))
 
+static uint32_t apc_str_hash32(const char *s) {
+	uint32_t h = 5381;
+	while (*s) {
+		h = ((h << 5) + h) ^ (unsigned char)*s++;
+	}
+	return h;
+}
+
+/*
+ * A fingerprint of every build property that affects the binary layout of the
+ * shm-resident structures or the meaning of the in-segment lock. Two processes
+ * may share a segment only if these match. ZEND_MODULE_BUILD_ID encodes the
+ * Zend API version, ZTS-vs-NTS and debug-vs-release (so a ZTS process cannot
+ * silently attach to an NTS segment whose apc_cache_header_t differs); the
+ * struct sizes catch APCu-side layout changes; sizeof(apc_lock_t) catches an
+ * incompatible lock backend even when the other sizes coincide.
+ */
 static uint32_t apc_sma_layout_check(void) {
-	return (uint32_t)(sizeof(sma_header_t)
-		^ (sizeof(block_t) << 8)
-		^ (sizeof(apc_mutex_t) << 16)
-		^ (SIZEOF_SIZE_T << 24));
+	return apc_str_hash32(ZEND_MODULE_BUILD_ID)
+		^ (uint32_t)sizeof(sma_header_t)
+		^ ((uint32_t)sizeof(block_t) << 8)
+		^ ((uint32_t)sizeof(apc_mutex_t) << 16)
+		^ ((uint32_t)sizeof(apc_lock_t) << 4)
+		^ ((uint32_t)sizeof(apc_cache_header_t) << 12)
+		^ ((uint32_t)sizeof(apc_cache_entry_t) << 20)
+		^ ((uint32_t)SIZEOF_SIZE_T << 24);
 }
 
 /*
@@ -407,6 +428,18 @@ PHP_APCU_API void apc_sma_init(apc_sma_t* sma, void** data, apc_sma_expunge_f ex
 		if (hugepage_size) {
 			zend_error_noreturn(E_CORE_ERROR, "apc.mmap_hugepage_size cannot be combined with apc.mmap_shared_file");
 		}
+#ifdef ZTS
+		/* Under ZTS one mapping is shared by all threads; a rotation cannot
+		 * swap it safely without quiescing them, and apc_cache_header_t
+		 * differs from NTS, so cross-flavor attach would corrupt. */
+		zend_error_noreturn(E_CORE_ERROR, "apc.mmap_shared_file is not supported on ZTS (thread-safe) builds");
+#endif
+#ifdef APC_LOCK_FILE
+		/* The fcntl lock backend stores a process-local file descriptor in
+		 * shared memory, so an attaching process would run with effectively no
+		 * cross-process locking. Refuse rather than corrupt silently. */
+		zend_error_noreturn(E_CORE_ERROR, "apc.mmap_shared_file requires a process-shared lock backend, but this APCu build uses fcntl file locks which cannot coordinate unrelated processes; rebuild with pthread rwlocks/mutexes or spinlocks");
+#endif
 
 		sma->shared_mode = 1;
 		{
