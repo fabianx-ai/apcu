@@ -101,7 +101,7 @@ PHP_APCU_API zend_bool apc_sma_shared_attached(const apc_sma_t *sma);
  * adopt them. Only valid in shared mode, called by the creating process.
  */
 PHP_APCU_API void apc_sma_shared_set_cache_info(
-		apc_sma_t *sma, void *cache_header, size_t nslots, const char *serializer_name);
+		apc_sma_t *sma, void *cache_header, size_t cache_span, size_t nslots, const char *serializer_name);
 
 /*
  * Returns the user cache header of a shared segment this process attached

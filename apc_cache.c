@@ -393,8 +393,10 @@ PHP_APCU_API apc_cache_t* apc_cache_create(apc_sma_t* sma, apc_serializer_t* ser
 	CREATE_LOCK(&cache->header->lock);
 
 	if (sma->shared_mode) {
-		/* let attaching processes find the cache header and adopt our layout */
-		apc_sma_shared_set_cache_info(sma, cache->header, nslots,
+		/* let attaching processes find the cache header and adopt our layout;
+		 * cache_size is the header + slots span, used to bounds-check the
+		 * segment on attach */
+		apc_sma_shared_set_cache_info(sma, cache->header, cache_size, nslots,
 			serializer ? serializer->name : "php");
 	}
 

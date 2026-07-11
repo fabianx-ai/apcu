@@ -36,6 +36,7 @@
 #include <sys/mman.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 /*
  * Some operating systems (like FreeBSD) have a MAP_NOSYNC flag that
@@ -150,6 +151,56 @@ void apc_unmap(void *shmaddr, size_t size)
  * segment is fully initialized or validated. */
 static int apc_mmap_shared_lock_fd = -1;
 
+/* O_NOFOLLOW refuses to open a symlink at the final path component (the
+ * classic "plant a symlink at a predictable path so root writes elsewhere"
+ * attack); O_CLOEXEC keeps the segment/lock fd out of exec'd children. Not
+ * every platform defines them, so degrade gracefully. */
+#ifndef O_NOFOLLOW
+# define O_NOFOLLOW 0
+#endif
+#ifndef O_CLOEXEC
+# define O_CLOEXEC 0
+#endif
+#define APC_SHARED_OPEN_FLAGS (O_RDWR | O_NOFOLLOW | O_CLOEXEC)
+
+/*
+ * Predicate: is a stat'd shared-segment file plausibly trustworthy rather than
+ * something an attacker planted at a predictable path? Requires a regular file,
+ * owned by us or by root, with no extra hard links and not group/world
+ * writable. This does not make a file a hostile user can still write safe —
+ * that is impossible by construction, and the path must live in a directory
+ * only trusted users can write — but it closes the pre-creation, symlink, and
+ * crafted-content classes for the recommended 0600 same-owner deployment.
+ */
+static zend_bool apc_mmap_shared_fd_ok(const struct stat *st)
+{
+	return S_ISREG(st->st_mode)
+		&& (st->st_uid == geteuid() || st->st_uid == 0)
+		&& st->st_nlink == 1
+		&& !(st->st_mode & (S_IWGRP | S_IWOTH));
+}
+
+/* Fatal variant for the attach/create path, which reports a specific reason. */
+static void apc_mmap_shared_check_fd(int fd, const char *file_path, const struct stat *st)
+{
+	if (!S_ISREG(st->st_mode)) {
+		close(fd);
+		zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: %s is not a regular file; refusing to use it as a shared segment", file_path);
+	}
+	if (st->st_uid != geteuid() && st->st_uid != 0) {
+		close(fd);
+		zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: %s is owned by uid %d, not by this process (%d) or root; refusing to attach (possible planted file)", file_path, (int)st->st_uid, (int)geteuid());
+	}
+	if (st->st_nlink != 1) {
+		close(fd);
+		zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: %s has %ld hard links; refusing to use it as a shared segment", file_path, (long)st->st_nlink);
+	}
+	if (st->st_mode & (S_IWGRP | S_IWOTH)) {
+		close(fd);
+		zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: %s is group/world writable; refusing to use it as a shared segment (any writer could corrupt every attached process)", file_path);
+	}
+}
+
 void *apc_mmap_shared(char *file_path, size_t *size, zend_bool *existed)
 {
 	void *shmaddr;
@@ -160,9 +211,9 @@ void *apc_mmap_shared(char *file_path, size_t *size, zend_bool *existed)
 	 * between our open() and flock(); detect that by comparing the inode we
 	 * locked with the inode currently at the path, and retry. */
 	for (attempts = 0; attempts < 5; attempts++) {
-		fd = open(file_path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+		fd = open(file_path, APC_SHARED_OPEN_FLAGS | O_CREAT, S_IRUSR | S_IWUSR);
 		if (fd == -1) {
-			zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: open on %s failed: %s", file_path, strerror(errno));
+			zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: open on %s failed: %s (a symlink at this path is refused)", file_path, strerror(errno));
 		}
 
 		/* Serialize segment creation/attach across processes. The lock is
@@ -193,6 +244,8 @@ void *apc_mmap_shared(char *file_path, size_t *size, zend_bool *existed)
 	if (fd == -1) {
 		zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: %s keeps changing while attaching (concurrent rotations?)", file_path);
 	}
+
+	apc_mmap_shared_check_fd(fd, file_path, &st);
 
 	if (st.st_size == 0) {
 		/* Fresh file: this process becomes the creator at the desired size. */
@@ -240,7 +293,7 @@ int apc_mmap_shared_lock_path(char *file_path)
 	int fd, rc, attempts;
 
 	for (attempts = 0; attempts < 5; attempts++) {
-		fd = open(file_path, O_RDWR);
+		fd = open(file_path, APC_SHARED_OPEN_FLAGS);
 		if (fd == -1) {
 			return -1;
 		}
@@ -251,7 +304,8 @@ int apc_mmap_shared_lock_path(char *file_path)
 			close(fd);
 			return -1;
 		}
-		if (fstat(fd, &st) == 0 && stat(file_path, &st_path) == 0
+		if (fstat(fd, &st) == 0 && apc_mmap_shared_fd_ok(&st)
+				&& stat(file_path, &st_path) == 0
 				&& st.st_ino == st_path.st_ino) {
 			return fd;
 		}
@@ -273,11 +327,11 @@ void *apc_mmap_file_open_existing(char *file_path, size_t *size_out)
 	struct stat st;
 	int fd;
 
-	fd = open(file_path, O_RDWR);
+	fd = open(file_path, APC_SHARED_OPEN_FLAGS);
 	if (fd == -1) {
 		return NULL;
 	}
-	if (fstat(fd, &st) != 0 || st.st_size == 0) {
+	if (fstat(fd, &st) != 0 || st.st_size == 0 || !apc_mmap_shared_fd_ok(&st)) {
 		close(fd);
 		return NULL;
 	}
@@ -303,7 +357,7 @@ void *apc_mmap_file_create(char *file_path, size_t size)
 	void *shmaddr;
 	int fd;
 
-	fd = open(file_path, O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
+	fd = open(file_path, APC_SHARED_OPEN_FLAGS | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
 	if (fd == -1) {
 		return NULL;
 	}

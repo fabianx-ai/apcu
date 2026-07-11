@@ -54,6 +54,7 @@ typedef struct apc_shared_seg_info_t {
 	uint32_t retired;         /* set once a successor segment replaced this one */
 	size_t segsize;           /* creator's segment size */
 	uintptr_t cache_off;      /* offset of the user cache header in the segment */
+	size_t cache_span;        /* bytes the cache header + slots array occupy */
 	size_t nslots;            /* user cache slot count chosen by the creator */
 	char serializer[APC_SHARED_SEG_SERIALIZER_LEN]; /* creator's serializer name */
 } apc_shared_seg_info_t;
@@ -283,10 +284,33 @@ static APC_HOTSPOT size_t sma_deallocate(sma_header_t *smaheader, size_t offset)
 PHP_APCU_API zend_bool apc_sma_shared_validate(void *shmaddr, size_t size) {
 	apc_shared_seg_info_t *info = &((sma_header_t *)shmaddr)->shared_info;
 
-	return info->magic == APC_SHARED_SEG_MAGIC
-		&& info->php_version_id == (uint32_t)PHP_VERSION_ID
-		&& info->layout_check == apc_sma_layout_check()
-		&& info->segsize == size;
+	if (info->magic != APC_SHARED_SEG_MAGIC
+			|| info->php_version_id != (uint32_t)PHP_VERSION_ID
+			|| info->layout_check != apc_sma_layout_check()
+			|| info->segsize != size) {
+		return 0;
+	}
+
+	/* cache_off, cache_span and nslots are read straight from the segment and
+	 * then used for pointer arithmetic and slot iteration in every attaching
+	 * process (apc_sma_shared_get_cache_info -> apc_cache_shared_adopt). A
+	 * crafted or corrupt segment that passed the magic check must not be able
+	 * to point the cache header or slots array outside the mapping. Require
+	 * the whole cache header + slots array to fit within the segment, and the
+	 * span to be consistent with the slot count. */
+	if (info->cache_off < ALIGNWORD(sizeof(sma_header_t)) || info->cache_off >= size) {
+		return 0;
+	}
+	if (info->nslots == 0 || info->nslots > size / sizeof(uintptr_t)) {
+		return 0;
+	}
+	if (info->cache_span < info->nslots * sizeof(uintptr_t)
+			|| info->cache_span > size
+			|| info->cache_off + info->cache_span > size) {
+		return 0;
+	}
+
+	return 1;
 }
 
 /*
@@ -416,13 +440,14 @@ PHP_APCU_API zend_bool apc_sma_shared_attached(const apc_sma_t *sma) {
 }
 
 PHP_APCU_API void apc_sma_shared_set_cache_info(
-		apc_sma_t *sma, void *cache_header, size_t nslots, const char *serializer_name) {
+		apc_sma_t *sma, void *cache_header, size_t cache_span, size_t nslots, const char *serializer_name) {
 	sma_header_t *smaheader = sma->shmaddr;
 	apc_shared_seg_info_t *info = &smaheader->shared_info;
 
 	ZEND_ASSERT(sma->shared_mode && !sma->shared_attached);
 
 	info->cache_off = (uintptr_t)((char *)cache_header - (char *)sma->shmaddr);
+	info->cache_span = cache_span;
 	info->nslots = nslots;
 	strncpy(info->serializer, serializer_name ? serializer_name : "php",
 		APC_SHARED_SEG_SERIALIZER_LEN - 1);
