@@ -119,6 +119,42 @@ PHP_APCU_API void *apc_sma_shared_get_cache_info(
 PHP_APCU_API void apc_sma_shared_mark_ready(apc_sma_t *sma);
 
 /*
+ * Returns 1 when the currently mapped shared segment has been retired by a
+ * rotation (a successor segment exists at the shared file path).
+ */
+PHP_APCU_API zend_bool apc_sma_shared_is_retired(const apc_sma_t *sma);
+
+/* Same check for a raw mapping that is not (yet) tracked by an apc_sma_t. */
+PHP_APCU_API zend_bool apc_sma_shared_addr_retired(void *shmaddr);
+
+/*
+ * Marks the currently mapped segment as retired. Called by the rotating
+ * process after the successor was atomically renamed over the shared file
+ * path, under the rotation flock.
+ */
+PHP_APCU_API void apc_sma_shared_retire(apc_sma_t *sma);
+
+/*
+ * Validates that shmaddr holds a ready, layout-compatible shared segment of
+ * the given size. Unlike attach-time validation this never raises.
+ */
+PHP_APCU_API zend_bool apc_sma_shared_validate(void *shmaddr, size_t size);
+
+/*
+ * Points sma at a different, already validated shared segment mapping
+ * (successor after rotation) and recomputes process-local limits. The caller
+ * unmaps the previous mapping afterwards.
+ */
+PHP_APCU_API void apc_sma_shared_swap(apc_sma_t *sma, void *new_addr, size_t new_size);
+
+/*
+ * Initializes all shm-resident SMA structures on sma->shmaddr (segment lock,
+ * header, block lists). Used at MINIT for fresh segments and by rotation to
+ * build a successor segment.
+ */
+PHP_APCU_API void apc_sma_init_segment(apc_sma_t *sma, size_t min_alloc_size);
+
+/*
  * apc_sma_detach will detach from shared memory and cleanup local allocations.
  */
 PHP_APCU_API void apc_sma_detach(apc_sma_t* sma);

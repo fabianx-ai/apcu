@@ -307,6 +307,20 @@ PHP_APCU_API int APC_UNSERIALIZER_NAME(php) (APC_UNSERIALIZER_ARGS)
 	return 1;
 }
 
+/*
+ * (Re-)points a cache at the shm structures of the shared segment currently
+ * mapped by sma: the cache header, slots array and slot count recorded by
+ * the segment's creator. Used at attach time and after a rotation swap.
+ */
+PHP_APCU_API void apc_cache_shared_adopt(apc_cache_t *cache, apc_sma_t *sma) {
+	char seg_serializer[APC_SHARED_SEG_SERIALIZER_LEN];
+	size_t nslots;
+
+	cache->header = apc_sma_shared_get_cache_info(sma, &nslots, seg_serializer);
+	cache->slots = (uintptr_t *)((uintptr_t)cache->header + sizeof(apc_cache_header_t));
+	cache->nslots = nslots;
+}
+
 PHP_APCU_API apc_cache_t* apc_cache_create(apc_sma_t* sma, apc_serializer_t* serializer, zend_long size_hint, zend_long gc_ttl, zend_long ttl, double expunge_threshold, zend_bool defend) {
 	apc_cache_t* cache;
 	zend_long cache_size;
@@ -319,16 +333,15 @@ PHP_APCU_API apc_cache_t* apc_cache_create(apc_sma_t* sma, apc_serializer_t* ser
 		const char *serializer_name = serializer ? serializer->name : "php";
 
 		cache = pemalloc(sizeof(apc_cache_t), 1);
-		cache->header = apc_sma_shared_get_cache_info(sma, &nslots, seg_serializer);
-		cache->slots = (uintptr_t *)((uintptr_t)cache->header + sizeof(apc_cache_header_t));
 		cache->sma = sma;
 		cache->serializer = serializer;
-		cache->nslots = nslots;
 		cache->gc_ttl = gc_ttl;
 		cache->ttl = ttl;
 		cache->expunge_threshold = expunge_threshold;
 		cache->defend = defend;
+		apc_cache_shared_adopt(cache, sma);
 
+		apc_sma_shared_get_cache_info(sma, &nslots, seg_serializer);
 		if (strcmp(seg_serializer, serializer_name) != 0) {
 			apc_warning("apc.mmap_shared_file: segment was created with serializer '%s' but this process uses '%s'; entries may fail to unserialize", seg_serializer, serializer_name);
 		}
@@ -386,6 +399,61 @@ PHP_APCU_API apc_cache_t* apc_cache_create(apc_sma_t* sma, apc_serializer_t* ser
 	}
 
 	return cache;
+}
+
+/*
+ * Copies all live entries of old_cache into new_cache, which must be a
+ * freshly created cache in a segment not yet visible to other processes
+ * (rotation builds it under a private name), so new_cache needs no locking.
+ *
+ * Entries are relocatable as raw bytes: every pointer-like value inside an
+ * entry is an offset relative to the entry itself, and the inter-entry
+ * next/prev offsets are rebuilt by re-linking. Migration is best-effort: it
+ * stops when the new segment is full (rotation to a smaller size simply
+ * migrates what fits). Returns the number of migrated entries.
+ */
+PHP_APCU_API size_t apc_cache_shared_migrate(apc_cache_t *old_cache, apc_cache_t *new_cache) {
+	size_t i, s, migrated = 0;
+	time_t t = apc_time();
+
+	if (!apc_lock_rlock(&old_cache->header->lock)) {
+		return 0;
+	}
+
+	for (i = 0; i < old_cache->nslots; i++) {
+		uintptr_t entry_offset = old_cache->slots[i];
+		while (entry_offset) {
+			apc_cache_entry_t *entry =
+				(apc_cache_entry_t *)((uintptr_t)old_cache->header + entry_offset);
+			apc_cache_entry_t *copy;
+
+			entry_offset = entry->next;
+
+			if (apc_cache_entry_expired(old_cache, entry, t)) {
+				continue;
+			}
+
+			copy = apc_sma_malloc(new_cache->sma, entry->mem_size, NULL);
+			if (!copy) {
+				/* new segment is full: keep what we have */
+				goto done;
+			}
+			memcpy(copy, entry, entry->mem_size);
+			copy->ref_count = 1;
+			copy->dtime = 0;
+			copy->nhits = 0;
+
+			apc_cache_hash_slot(new_cache, &copy->key, &s);
+			apc_cache_wlocked_link_entry(new_cache, &new_cache->slots[s], copy);
+			new_cache->header->mem_size += copy->mem_size;
+			new_cache->header->nentries++;
+			migrated++;
+		}
+	}
+
+done:
+	apc_lock_runlock(&old_cache->header->lock);
+	return migrated;
 }
 
 static inline zend_bool apc_cache_wlocked_insert(

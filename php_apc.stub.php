@@ -5,6 +5,23 @@
  * @generate-legacy-arginfo
  */
 
+/**
+ * Rotates the file-backed shared segment (apc.mmap_shared_file): builds a
+ * fresh segment (optionally with a new size), migrates live entries into it,
+ * atomically replaces the shared file and retires the old segment so all
+ * attached processes re-attach at their next request start.
+ * Returns the number of migrated entries, or false on failure.
+ */
+function apcu_rotate_segment(?int $new_size = null, bool $migrate = true): int|false {}
+
+/**
+ * Re-attaches to the current shared segment if this process's mapping was
+ * retired by a rotation. Mainly useful for long-running CLI processes; web
+ * requests refresh automatically at request start.
+ * Returns true when the process is attached to the current segment.
+ */
+function apcu_segment_refresh(): bool {}
+
 function apcu_clear_cache(): bool {}
 
 function apcu_cache_info(bool $limited = false): array|false {}

@@ -44,12 +44,19 @@ void apc_unmap(void *shmaddr, size_t size);
  * The file is created and sized on first use; subsequent processes attach.
  * On return the process holds an exclusive flock on the file; the caller
  * must call apc_mmap_shared_release_lock() once segment initialization (or
- * attach validation) is complete. *existed is set to 1 when a file of the
- * expected size was already present (attach candidate), 0 when this process
- * created the file and must initialize the segment.
+ * attach validation) is complete. *size is the desired size when creating;
+ * on return it holds the actual mapped size (an existing segment is mapped
+ * at its own size, which a rotation may have changed). *existed is set to 1
+ * when a non-empty file was already present (attach candidate), 0 when this
+ * process created the file and must initialize the segment.
  */
-void *apc_mmap_shared(char *file_path, size_t size, zend_bool *existed);
+void *apc_mmap_shared(char *file_path, size_t *size, zend_bool *existed);
 void apc_mmap_shared_release_lock(void);
+
+/* Rotation support: map the current segment file as-is / build a successor. */
+void *apc_mmap_file_open_existing(char *file_path, size_t *size_out);
+void *apc_mmap_file_create(char *file_path, size_t size);
+int apc_mmap_shared_lock_path(char *file_path);
 #endif
 
 #endif

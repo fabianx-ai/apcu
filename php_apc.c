@@ -348,6 +348,8 @@ static PHP_MSHUTDOWN_FUNCTION(apcu)
 	return SUCCESS;
 }
 
+static zend_bool apc_shared_segment_refresh(void);
+
 static PHP_RINIT_FUNCTION(apcu)
 {
 #if defined(ZTS) && defined(COMPILE_DL_APCU)
@@ -356,6 +358,9 @@ static PHP_RINIT_FUNCTION(apcu)
 
 	APCG(request_time) = 0;
 	if (APCG(enabled)) {
+		/* Follow a segment rotation performed by another process. */
+		apc_shared_segment_refresh();
+
 		if (APCG(serializer_name)) {
 			/* Avoid race conditions between MINIT of apc and serializer exts like igbinary */
 			apc_cache_serializer(apc_user_cache, APCG(serializer_name));
@@ -367,6 +372,210 @@ static PHP_RINIT_FUNCTION(apcu)
 	}
 	return SUCCESS;
 }
+
+#if defined(APC_MMAP) && !defined(ZTS)
+/* During rotation the successor segment must not evict what we migrate;
+ * a failed allocation simply ends the best-effort migration. */
+static zend_bool apc_shared_rotation_noop_expunge(void *data, size_t size) {
+	(void)data;
+	(void)size;
+	return 0;
+}
+#endif
+
+/*
+ * Re-attaches to the successor segment when the currently mapped shared
+ * segment was retired by a rotation in another process. Called at request
+ * start (one shared-memory read when nothing changed) and before rotating.
+ * Returns 1 when the mapping changed.
+ */
+static zend_bool apc_shared_segment_refresh(void)
+{
+#if defined(APC_MMAP) && !defined(ZTS)
+	char *path;
+	int attempts;
+
+	if (!APCG(enabled) || !APCG(initialized) || !apc_sma.shared_mode) {
+		return 0;
+	}
+	if (!apc_sma_shared_is_retired(&apc_sma)) {
+		return 0;
+	}
+
+	path = APCG(mmap_shared_file);
+	for (attempts = 0; attempts < 5; attempts++) {
+		void *old_addr, *new_addr;
+		size_t old_size, new_size = 0;
+
+		new_addr = apc_mmap_file_open_existing(path, &new_size);
+		if (!new_addr) {
+			apc_warning("apcu: shared segment was retired but its successor %s cannot be mapped; still using the retired segment", path);
+			return 0;
+		}
+		if (!apc_sma_shared_validate(new_addr, new_size)) {
+			apc_unmap(new_addr, new_size);
+			apc_warning("apcu: shared segment was retired but its successor %s is not compatible; still using the retired segment", path);
+			return 0;
+		}
+		if (apc_sma_shared_addr_retired(new_addr)) {
+			/* the successor was itself already rotated away; take the newer one */
+			apc_unmap(new_addr, new_size);
+			continue;
+		}
+
+		old_addr = apc_sma.shmaddr;
+		old_size = apc_sma.size;
+		apc_sma_shared_swap(&apc_sma, new_addr, new_size);
+		apc_cache_shared_adopt(apc_user_cache, &apc_sma);
+		apc_unmap(old_addr, old_size);
+		return 1;
+	}
+#endif
+	return 0;
+}
+
+/* {{{ proto int|false apcu_rotate_segment(?int new_size = null, bool migrate = true) */
+PHP_FUNCTION(apcu_rotate_segment)
+{
+	zend_long new_size = 0;
+	zend_bool size_is_null = 1;
+	zend_bool migrate = 1;
+
+	ZEND_PARSE_PARAMETERS_START(0, 2)
+		Z_PARAM_OPTIONAL
+		Z_PARAM_LONG_OR_NULL(new_size, size_is_null)
+		Z_PARAM_BOOL(migrate)
+	ZEND_PARSE_PARAMETERS_END();
+
+#if !defined(APC_MMAP)
+	php_error_docref(NULL, E_WARNING, "apcu_rotate_segment requires MMAP support");
+	RETURN_FALSE;
+#elif defined(ZTS)
+	php_error_docref(NULL, E_WARNING, "apcu_rotate_segment is not supported on ZTS builds");
+	RETURN_FALSE;
+#else
+	char tmp_path[MAXPATHLEN];
+	char *path;
+	int attempts;
+
+	if (!APCG(enabled) || !APCG(initialized)) {
+		php_error_docref(NULL, E_WARNING, "APC is not enabled or not initialized");
+		RETURN_FALSE;
+	}
+	if (!apc_sma.shared_mode) {
+		php_error_docref(NULL, E_WARNING, "apcu_rotate_segment requires apc.mmap_shared_file");
+		RETURN_FALSE;
+	}
+
+	path = APCG(mmap_shared_file);
+	if (size_is_null) {
+		new_size = apc_sma.size;
+	}
+	new_size = ALIGNWORD(new_size);
+	if (new_size < 1024 * 1024) {
+		php_error_docref(NULL, E_WARNING, "apcu_rotate_segment: new size must be at least 1MB");
+		RETURN_FALSE;
+	}
+	if (snprintf(tmp_path, sizeof(tmp_path), "%s.new", path) >= (int)sizeof(tmp_path)) {
+		php_error_docref(NULL, E_WARNING, "apcu_rotate_segment: shared file path too long");
+		RETURN_FALSE;
+	}
+
+	for (attempts = 0; attempts < 3; attempts++) {
+		apc_sma_t tmp_sma;
+		apc_cache_t *tmp_cache;
+		void *old_addr;
+		size_t old_size, migrated = 0;
+		int lock_fd;
+
+		/* converge onto the current segment (ours may already be retired) */
+		apc_shared_segment_refresh();
+
+		lock_fd = apc_mmap_shared_lock_path(path);
+		if (lock_fd == -1) {
+			php_error_docref(NULL, E_WARNING, "apcu_rotate_segment: cannot lock %s: %s", path, strerror(errno));
+			RETURN_FALSE;
+		}
+
+		/* If our mapping was retired while we waited for the lock, another
+		 * rotator won the race; refresh and try again. */
+		if (apc_sma_shared_is_retired(&apc_sma)) {
+			close(lock_fd);
+			continue;
+		}
+
+		/* Build the complete successor under a private name. */
+		unlink(tmp_path);
+		memset(&tmp_sma, 0, sizeof(tmp_sma));
+		tmp_sma.initialized = 1;
+		tmp_sma.shared_mode = 1;
+		tmp_sma.expunge = apc_shared_rotation_noop_expunge;
+		tmp_sma.data = (void **)&tmp_cache;
+		tmp_sma.size = (size_t)new_size;
+		tmp_sma.shmaddr = apc_mmap_file_create(tmp_path, tmp_sma.size);
+		if (!tmp_sma.shmaddr) {
+			close(lock_fd);
+			php_error_docref(NULL, E_WARNING, "apcu_rotate_segment: cannot create %s: %s", tmp_path, strerror(errno));
+			RETURN_FALSE;
+		}
+		apc_sma_init_segment(&tmp_sma, APC_ENTRY_SIZE(0));
+		tmp_cache = apc_cache_create(
+			&tmp_sma, apc_user_cache->serializer,
+			APCG(entries_hint), APCG(gc_ttl), APCG(ttl), APCG(expunge_threshold), APCG(slam_defense));
+
+		if (migrate) {
+			migrated = apc_cache_shared_migrate(apc_user_cache, tmp_cache);
+		}
+		apc_sma_shared_mark_ready(&tmp_sma);
+
+		/* Publish: successor becomes the file at the path, the old segment
+		 * is tombstoned so attached processes re-attach at request start. */
+		if (rename(tmp_path, path) != 0) {
+			php_error_docref(NULL, E_WARNING, "apcu_rotate_segment: rename to %s failed: %s", path, strerror(errno));
+			apc_unmap(tmp_sma.shmaddr, tmp_sma.size);
+			unlink(tmp_path);
+			pefree(tmp_cache, 1);
+			close(lock_fd);
+			RETURN_FALSE;
+		}
+		apc_sma_shared_retire(&apc_sma);
+
+		/* Switch this process over (we already map the successor). */
+		old_addr = apc_sma.shmaddr;
+		old_size = apc_sma.size;
+		apc_sma_shared_swap(&apc_sma, tmp_sma.shmaddr, tmp_sma.size);
+		apc_cache_shared_adopt(apc_user_cache, &apc_sma);
+		pefree(tmp_cache, 1);
+		apc_unmap(old_addr, old_size);
+		close(lock_fd);
+
+		RETURN_LONG((zend_long)migrated);
+	}
+
+	php_error_docref(NULL, E_WARNING, "apcu_rotate_segment: lost the rotation race repeatedly, giving up");
+	RETURN_FALSE;
+#endif
+}
+/* }}} */
+
+/* {{{ proto bool apcu_segment_refresh() */
+PHP_FUNCTION(apcu_segment_refresh)
+{
+	if (zend_parse_parameters_none() == FAILURE) {
+		return;
+	}
+
+#if defined(APC_MMAP) && !defined(ZTS)
+	if (!APCG(enabled) || !APCG(initialized) || !apc_sma.shared_mode) {
+		RETURN_FALSE;
+	}
+	apc_shared_segment_refresh();
+	RETURN_BOOL(!apc_sma_shared_is_retired(&apc_sma));
+#else
+	RETURN_FALSE;
+#endif
+}
+/* }}} */
 
 /* proto void apcu_clear_cache() */
 PHP_FUNCTION(apcu_clear_cache)

@@ -51,7 +51,7 @@ typedef struct apc_shared_seg_info_t {
 	uint32_t magic;           /* APC_SHARED_SEG_MAGIC once fully initialized */
 	uint32_t php_version_id;  /* PHP_VERSION_ID of the creating process */
 	uint32_t layout_check;    /* sizeof checks of shm-resident structs */
-	uint32_t reserved;
+	uint32_t retired;         /* set once a successor segment replaced this one */
 	size_t segsize;           /* creator's segment size */
 	uintptr_t cache_off;      /* offset of the user cache header in the segment */
 	size_t nslots;            /* user cache slot count chosen by the creator */
@@ -276,65 +276,26 @@ static APC_HOTSPOT size_t sma_deallocate(sma_header_t *smaheader, size_t offset)
 	return size;
 }
 
-PHP_APCU_API void apc_sma_init(apc_sma_t* sma, void** data, apc_sma_expunge_f expunge, size_t size, size_t min_alloc_size, char *mask, zend_long hugepage_size, char *shared_file) {
-	if (sma->initialized) {
-		return;
-	}
+/*
+ * Validates that shmaddr holds a fully initialized shared segment of the
+ * given size that is layout-compatible with this process.
+ */
+PHP_APCU_API zend_bool apc_sma_shared_validate(void *shmaddr, size_t size) {
+	apc_shared_seg_info_t *info = &((sma_header_t *)shmaddr)->shared_info;
 
-	sma->initialized = 1;
-	sma->expunge = expunge;
-	sma->data = data;
-	sma->size = ALIGNWORD(size > 0 ? size : SMA_DEFAULT_SEGSIZE);
-	sma->shared_mode = 0;
-	sma->shared_attached = 0;
+	return info->magic == APC_SHARED_SEG_MAGIC
+		&& info->php_version_id == (uint32_t)PHP_VERSION_ID
+		&& info->layout_check == apc_sma_layout_check()
+		&& info->segsize == size;
+}
 
-#ifdef APC_MMAP
-	if (shared_file && *shared_file) {
-		zend_bool existed = 0;
-
-		if (hugepage_size) {
-			zend_error_noreturn(E_CORE_ERROR, "apc.mmap_hugepage_size cannot be combined with apc.mmap_shared_file");
-		}
-
-		sma->shared_mode = 1;
-		sma->shmaddr = apc_mmap_shared(shared_file, sma->size, &existed);
-
-		if (existed) {
-			sma_header_t *smaheader = sma->shmaddr;
-			apc_shared_seg_info_t *info = &smaheader->shared_info;
-
-			if (info->magic == APC_SHARED_SEG_MAGIC) {
-				/* Fully initialized segment from another process: validate
-				 * compatibility, then attach without touching shm state. */
-				if (info->php_version_id != (uint32_t)PHP_VERSION_ID
-						|| info->layout_check != apc_sma_layout_check()
-						|| info->segsize != sma->size) {
-					zend_error_noreturn(E_CORE_ERROR,
-						"apc.mmap_shared_file: existing segment in %s is incompatible "
-						"(created by PHP version id %u with segment size %zu); "
-						"remove the file or align PHP version and apc.shm_size across processes",
-						shared_file, info->php_version_id, info->segsize);
-				}
-
-				/* Recompute max_alloc_size exactly as the creator did from
-				 * the initial avail; header->avail has changed since. */
-				sma->max_alloc_size = sma->size
-					- ALIGNWORD(sizeof(sma_header_t))
-					- 3 * ALIGNWORD(sizeof(block_t));
-				sma->shared_attached = 1;
-				return;
-			}
-			/* Sized file without the ready-magic: a previous initialization
-			 * crashed midway (the flock we hold proves no live process is
-			 * initializing it). Fall through and re-initialize. */
-		}
-	} else {
-		sma->shmaddr = apc_mmap(mask, sma->size, hugepage_size);
-	}
-#else
-	sma->shmaddr = apc_shm_attach(sma->size);
-#endif
-
+/*
+ * Initializes all shm-resident SMA structures (lock, header, block lists)
+ * on sma->shmaddr and computes the process-local allocation limit. In shared
+ * mode the compatibility info is recorded, but the segment is not marked
+ * ready until apc_sma_shared_mark_ready().
+ */
+PHP_APCU_API void apc_sma_init_segment(apc_sma_t *sma, size_t min_alloc_size) {
 	sma_header_t *smaheader = sma->shmaddr;
 	SMA_CREATE_LOCK(&smaheader->sma_lock);
 	smaheader->min_block_size = min_alloc_size > 0 ? ALIGNWORD(min_alloc_size + ALIGNWORD(sizeof(block_t))) : MINBLOCKSIZE;
@@ -374,6 +335,82 @@ PHP_APCU_API void apc_sma_init(apc_sma_t* sma, void** data, apc_sma_expunge_f ex
 	}
 }
 
+PHP_APCU_API void apc_sma_init(apc_sma_t* sma, void** data, apc_sma_expunge_f expunge, size_t size, size_t min_alloc_size, char *mask, zend_long hugepage_size, char *shared_file) {
+	if (sma->initialized) {
+		return;
+	}
+
+	sma->initialized = 1;
+	sma->expunge = expunge;
+	sma->data = data;
+	sma->size = ALIGNWORD(size > 0 ? size : SMA_DEFAULT_SEGSIZE);
+	sma->shared_mode = 0;
+	sma->shared_attached = 0;
+
+#ifdef APC_MMAP
+	if (shared_file && *shared_file) {
+		zend_bool existed = 0;
+
+		if (hugepage_size) {
+			zend_error_noreturn(E_CORE_ERROR, "apc.mmap_hugepage_size cannot be combined with apc.mmap_shared_file");
+		}
+
+		sma->shared_mode = 1;
+		{
+			/* An existing segment is mapped and adopted at its own size (a
+			 * rotation may have resized it); apc.shm_size only applies when
+			 * this process creates the segment. */
+			size_t mapped_size = sma->size;
+			sma->shmaddr = apc_mmap_shared(shared_file, &mapped_size, &existed);
+
+			if (existed) {
+				sma_header_t *smaheader = sma->shmaddr;
+				apc_shared_seg_info_t *info = &smaheader->shared_info;
+
+				if (info->magic == APC_SHARED_SEG_MAGIC) {
+					/* Fully initialized segment from another process: validate
+					 * compatibility, then attach without touching shm state. */
+					if (!apc_sma_shared_validate(sma->shmaddr, mapped_size)) {
+						zend_error_noreturn(E_CORE_ERROR,
+							"apc.mmap_shared_file: existing segment in %s is incompatible "
+							"(created by PHP version id %u with segment size %zu); "
+							"remove the file or align the PHP version across processes",
+							shared_file, info->php_version_id, info->segsize);
+					}
+
+					sma->size = mapped_size;
+					/* Recompute max_alloc_size exactly as the creator did from
+					 * the initial avail; header->avail has changed since. */
+					sma->max_alloc_size = sma->size
+						- ALIGNWORD(sizeof(sma_header_t))
+						- 3 * ALIGNWORD(sizeof(block_t));
+					sma->shared_attached = 1;
+					return;
+				}
+
+				if (mapped_size != sma->size) {
+					/* A file this process didn't size, without a valid segment
+					 * in it: refuse to clobber what we cannot identify. */
+					zend_error_noreturn(E_CORE_ERROR,
+						"apc.mmap_shared_file: %s has size %zu, contains no valid segment, "
+						"and does not match apc.shm_size (%zu); remove the file manually",
+						shared_file, mapped_size, sma->size);
+				}
+				/* Sized file without the ready-magic: a previous initialization
+				 * crashed midway (the flock we hold proves no live process is
+				 * initializing it). Fall through and re-initialize. */
+			}
+		}
+	} else {
+		sma->shmaddr = apc_mmap(mask, sma->size, hugepage_size);
+	}
+#else
+	sma->shmaddr = apc_shm_attach(sma->size);
+#endif
+
+	apc_sma_init_segment(sma, min_alloc_size);
+}
+
 PHP_APCU_API zend_bool apc_sma_shared_attached(const apc_sma_t *sma) {
 	return sma->shared_attached;
 }
@@ -411,6 +448,34 @@ PHP_APCU_API void apc_sma_shared_mark_ready(apc_sma_t *sma) {
 		return;
 	}
 	smaheader->shared_info.magic = APC_SHARED_SEG_MAGIC;
+}
+
+PHP_APCU_API zend_bool apc_sma_shared_is_retired(const apc_sma_t *sma) {
+	if (!sma->shared_mode) {
+		return 0;
+	}
+	return ((sma_header_t *)sma->shmaddr)->shared_info.retired != 0;
+}
+
+PHP_APCU_API zend_bool apc_sma_shared_addr_retired(void *shmaddr) {
+	return ((sma_header_t *)shmaddr)->shared_info.retired != 0;
+}
+
+PHP_APCU_API void apc_sma_shared_retire(apc_sma_t *sma) {
+	/* Guarded by the rotating process's flock on the segment file, not by
+	 * the cache lock: retirement must work even when the cache lock is
+	 * wedged by a crashed process. Attached processes poll this flag at
+	 * request start and re-attach to the successor segment. */
+	((sma_header_t *)sma->shmaddr)->shared_info.retired = 1;
+}
+
+PHP_APCU_API void apc_sma_shared_swap(apc_sma_t *sma, void *new_addr, size_t new_size) {
+	sma->shmaddr = new_addr;
+	sma->size = new_size;
+	sma->max_alloc_size = new_size
+		- ALIGNWORD(sizeof(sma_header_t))
+		- 3 * ALIGNWORD(sizeof(block_t));
+	sma->shared_attached = 1;
 }
 
 PHP_APCU_API void apc_sma_detach(apc_sma_t* sma) {

@@ -150,51 +150,69 @@ void apc_unmap(void *shmaddr, size_t size)
  * segment is fully initialized or validated. */
 static int apc_mmap_shared_lock_fd = -1;
 
-void *apc_mmap_shared(char *file_path, size_t size, zend_bool *existed)
+void *apc_mmap_shared(char *file_path, size_t *size, zend_bool *existed)
 {
 	void *shmaddr;
-	struct stat st;
-	int fd, rc;
+	struct stat st, st_path;
+	int fd = -1, rc, attempts;
 
-	fd = open(file_path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+	/* A segment rotation can atomically rename() a successor over file_path
+	 * between our open() and flock(); detect that by comparing the inode we
+	 * locked with the inode currently at the path, and retry. */
+	for (attempts = 0; attempts < 5; attempts++) {
+		fd = open(file_path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+		if (fd == -1) {
+			zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: open on %s failed: %s", file_path, strerror(errno));
+		}
+
+		/* Serialize segment creation/attach across processes. The lock is
+		 * held beyond this function so that a process attaching concurrently
+		 * cannot observe a partially initialized segment. */
+		do {
+			rc = flock(fd, LOCK_EX);
+		} while (rc == -1 && errno == EINTR);
+		if (rc == -1) {
+			close(fd);
+			zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: flock on %s failed: %s", file_path, strerror(errno));
+		}
+
+		if (fstat(fd, &st) != 0) {
+			close(fd);
+			zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: fstat on %s failed: %s", file_path, strerror(errno));
+		}
+
+		if (stat(file_path, &st_path) == 0 && st_path.st_ino == st.st_ino) {
+			break;
+		}
+
+		/* The file we locked is no longer the one at the path (rotated or
+		 * removed); start over with the current file. */
+		close(fd);
+		fd = -1;
+	}
 	if (fd == -1) {
-		zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: open on %s failed: %s", file_path, strerror(errno));
-	}
-
-	/* Serialize segment creation/attach across processes. The lock is held
-	 * beyond this function so that a process attaching concurrently cannot
-	 * observe a partially initialized segment. */
-	do {
-		rc = flock(fd, LOCK_EX);
-	} while (rc == -1 && errno == EINTR);
-	if (rc == -1) {
-		close(fd);
-		zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: flock on %s failed: %s", file_path, strerror(errno));
-	}
-
-	if (fstat(fd, &st) != 0) {
-		close(fd);
-		zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: fstat on %s failed: %s", file_path, strerror(errno));
+		zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: %s keeps changing while attaching (concurrent rotations?)", file_path);
 	}
 
 	if (st.st_size == 0) {
-		/* Fresh file: this process becomes the creator. */
+		/* Fresh file: this process becomes the creator at the desired size. */
 		*existed = 0;
-		if (ftruncate(fd, size) < 0) {
+		if (ftruncate(fd, *size) < 0) {
 			close(fd);
 			zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: ftruncate on %s failed: %s", file_path, strerror(errno));
 		}
-	} else if (st.st_size != (off_t)size) {
-		close(fd);
-		zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: %s has size %zd but apc.shm_size is %zu; remove the file or match apc.shm_size across all processes", file_path, (ssize_t)st.st_size, size);
 	} else {
+		/* Existing segment: map it at its own size. A rotation may have
+		 * resized it, so apc.shm_size only applies when creating; the caller
+		 * validates the segment and adopts its size. */
 		*existed = 1;
+		*size = (size_t)st.st_size;
 	}
 
-	shmaddr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NOSYNC, fd, 0);
+	shmaddr = mmap(NULL, *size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NOSYNC, fd, 0);
 	if (shmaddr == MAP_FAILED) {
 		close(fd);
-		zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: failed to mmap %zu bytes of %s. apc.shm_size may be too large.", size, file_path);
+		zend_error_noreturn(E_CORE_ERROR, "apc_mmap_shared: failed to mmap %zu bytes of %s. apc.shm_size may be too large.", *size, file_path);
 	}
 
 	apc_mmap_shared_lock_fd = fd;
@@ -208,6 +226,101 @@ void apc_mmap_shared_release_lock(void)
 		close(apc_mmap_shared_lock_fd);
 		apc_mmap_shared_lock_fd = -1;
 	}
+}
+
+/*
+ * Takes the rotation/creation flock on the segment file currently at
+ * file_path (without creating it), retrying if a concurrent rotation
+ * rename()s a successor over the path between open and lock. Returns the
+ * locked fd, or -1 on failure. The caller releases the lock via close().
+ */
+int apc_mmap_shared_lock_path(char *file_path)
+{
+	struct stat st, st_path;
+	int fd, rc, attempts;
+
+	for (attempts = 0; attempts < 5; attempts++) {
+		fd = open(file_path, O_RDWR);
+		if (fd == -1) {
+			return -1;
+		}
+		do {
+			rc = flock(fd, LOCK_EX);
+		} while (rc == -1 && errno == EINTR);
+		if (rc == -1) {
+			close(fd);
+			return -1;
+		}
+		if (fstat(fd, &st) == 0 && stat(file_path, &st_path) == 0
+				&& st.st_ino == st_path.st_ino) {
+			return fd;
+		}
+		close(fd);
+	}
+	return -1;
+}
+
+/*
+ * Maps an existing shared segment file at whatever size it currently has,
+ * without creating or locking anything. Used to re-attach to a successor
+ * segment after rotation (the file at the path is always fully initialized,
+ * because rotation builds the successor under a private name and rename()s
+ * it into place atomically). Returns NULL on failure.
+ */
+void *apc_mmap_file_open_existing(char *file_path, size_t *size_out)
+{
+	void *shmaddr;
+	struct stat st;
+	int fd;
+
+	fd = open(file_path, O_RDWR);
+	if (fd == -1) {
+		return NULL;
+	}
+	if (fstat(fd, &st) != 0 || st.st_size == 0) {
+		close(fd);
+		return NULL;
+	}
+
+	shmaddr = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NOSYNC, fd, 0);
+	close(fd);
+	if (shmaddr == MAP_FAILED) {
+		return NULL;
+	}
+
+	*size_out = st.st_size;
+	return shmaddr;
+}
+
+/*
+ * Creates and maps a fresh file of the given size at file_path (exclusive:
+ * fails if the file exists). Used by rotation to build a successor segment
+ * under a private name before rename()ing it over the shared file path.
+ * Returns NULL on failure.
+ */
+void *apc_mmap_file_create(char *file_path, size_t size)
+{
+	void *shmaddr;
+	int fd;
+
+	fd = open(file_path, O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
+	if (fd == -1) {
+		return NULL;
+	}
+	if (ftruncate(fd, size) < 0) {
+		close(fd);
+		unlink(file_path);
+		return NULL;
+	}
+
+	shmaddr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NOSYNC, fd, 0);
+	close(fd);
+	if (shmaddr == MAP_FAILED) {
+		unlink(file_path);
+		return NULL;
+	}
+
+	return shmaddr;
 }
 
 #endif

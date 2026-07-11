@@ -128,6 +128,18 @@ PHP_APCU_API apc_cache_t* apc_cache_create(
         zend_long gc_ttl, zend_long ttl, double expunge_threshold, zend_bool defend);
 
 /*
+ * (Re-)points a cache at the shm structures of the shared segment currently
+ * mapped by sma. Used when attaching and after a rotation swap.
+ */
+PHP_APCU_API void apc_cache_shared_adopt(apc_cache_t *cache, apc_sma_t *sma);
+
+/*
+ * Best-effort copy of all live entries of old_cache into new_cache (a fresh
+ * cache in a not-yet-published segment). Returns the migrated entry count.
+ */
+PHP_APCU_API size_t apc_cache_shared_migrate(apc_cache_t *old_cache, apc_cache_t *new_cache);
+
+/*
 * apc_cache_preload preloads the data at path into the specified cache
 */
 PHP_APCU_API zend_bool apc_cache_preload(apc_cache_t* cache, const char* path);
