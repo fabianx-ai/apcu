@@ -51,6 +51,10 @@ void apc_unmap(void *shmaddr, size_t size);
  * process created the file and must initialize the segment.
  */
 void *apc_mmap_shared(char *file_path, size_t *size, zend_bool *existed, char *errbuf, size_t errlen);
+/* Reserve backing storage for the currently-locked shared segment (used on the
+ * crashed-init recovery path, where the file exists but may be sparse). Returns
+ * 0 on success or when unsupported, else an errno-like value. */
+int apc_mmap_shared_reserve_current(size_t size);
 void apc_mmap_shared_release_lock(void);
 
 /* Rotation support: map the current segment file as-is / build a successor. */

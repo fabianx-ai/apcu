@@ -307,10 +307,24 @@ void *apc_mmap_shared(char *file_path, size_t *size, zend_bool *existed, char *e
 	return shmaddr;
 }
 
+int apc_mmap_shared_reserve_current(size_t size)
+{
+	if (apc_mmap_shared_lock_fd == -1) {
+		return 0;
+	}
+	return apc_mmap_reserve(apc_mmap_shared_lock_fd, size);
+}
+
 void apc_mmap_shared_release_lock(void)
 {
 	if (apc_mmap_shared_lock_fd != -1) {
-		/* closing the fd releases the flock; the mapping stays valid */
+		/* An flock is bound to the open file description, and the segment's
+		 * MAP_SHARED mapping keeps that description referenced for the life of
+		 * the process — so close() alone does NOT drop the lock (the lock would
+		 * persist until munmap, i.e. forever, serializing every other process's
+		 * MINIT attach and self-deadlocking rotation). Release it explicitly;
+		 * the mapping stays valid. */
+		flock(apc_mmap_shared_lock_fd, LOCK_UN);
 		close(apc_mmap_shared_lock_fd);
 		apc_mmap_shared_lock_fd = -1;
 	}
