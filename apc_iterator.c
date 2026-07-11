@@ -143,6 +143,9 @@ static void apc_iterator_free(zend_object *object) {
 		efree(iterator->search_hash);
 	}
 	iterator->initialized = 0;
+	if (APCG(iterator_level) > 0) {
+		APCG(iterator_level)--;
+	}
 
 	zend_object_std_dtor(object);
 }
@@ -385,6 +388,10 @@ void apc_iterator_obj_init(apc_iterator_t *iterator, zval *search, zend_long for
 		iterator->search_hash = apc_flip_hash(Z_ARRVAL_P(search));
 	}
 	iterator->initialized = 1;
+	/* Count live iterators: they hold raw pointers into the shared segment
+	 * across userland calls, so a segment rotation/refresh that unmaps the
+	 * segment mid-iteration must be refused while any are alive. */
+	APCG(iterator_level)++;
 }
 
 PHP_METHOD(APCUIterator, __construct) {
