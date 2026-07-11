@@ -537,7 +537,10 @@ PHP_FUNCTION(apcu_rotate_segment)
 
 		lock_fd = apc_mmap_shared_lock_path(path);
 		if (lock_fd == -1) {
-			php_error_docref(NULL, E_WARNING, "apcu_rotate_segment: cannot lock %s: %s", path, strerror(errno));
+			/* Not necessarily an errno failure: lock_path also returns -1 when
+			 * the file keeps changing (rotation storm) or fails the fd-safety
+			 * gate, neither of which sets errno. Don't print a stale strerror. */
+			php_error_docref(NULL, E_WARNING, "apcu_rotate_segment: cannot lock %s (rotation storm, or the file was replaced by an incompatible one)", path);
 			RETURN_FALSE;
 		}
 
@@ -564,6 +567,12 @@ PHP_FUNCTION(apcu_rotate_segment)
 						&& apc_sma_shared_addr_seg_id(path_addr) != apc_sma_shared_current_seg_id(&apc_sma)) {
 					old_addr = apc_sma.shmaddr;
 					old_size = apc_sma.size;
+					/* Tombstone the segment we were on before leaving it: the
+					 * publisher of the successor died before doing so, so any
+					 * OTHER process still attached to this segment would never
+					 * converge. We hold the flock and the path is authoritative,
+					 * so this segment is definitively orphaned. */
+					apc_sma_shared_retire(&apc_sma);
 					apc_sma_shared_swap(&apc_sma, path_addr, path_size);
 					apc_cache_shared_adopt(apc_user_cache, &apc_sma);
 					apc_unmap(old_addr, old_size);
