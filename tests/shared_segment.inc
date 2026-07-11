@@ -36,7 +36,12 @@ function shared_segment_extension_path() {
 }
 
 function shared_segment_path($name) {
-	return sys_get_temp_dir() . '/apcu_test_' . $name . '_' . getmypid() . '.seg';
+	/* Prefer a real tmpfs (/dev/shm) over the system temp dir: some overlay/
+	 * container filesystems release an flock on close() even while the file is
+	 * mmap'd, which would mask the cross-process locking behavior these tests
+	 * must exercise. tmpfs pins the lock like a normal local filesystem. */
+	$dir = is_dir('/dev/shm') && is_writable('/dev/shm') ? '/dev/shm' : sys_get_temp_dir();
+	return $dir . '/apcu_test_' . $name . '_' . getmypid() . '.seg';
 }
 
 function shared_segment_cmd($seg, $code, $shm_size = '8M', $extra_ini = []) {

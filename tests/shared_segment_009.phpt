@@ -16,37 +16,48 @@ require_once(dirname(__FILE__) . '/shared_segment.inc');
 $seg = shared_segment_path('009');
 shared_segment_cleanup($seg);
 
-/* Process A creates the segment and stores a key. */
-shared_segment_run($seg, 'apcu_store("orig", "in-original");');
-
-/* Process X rotates with the retire step suppressed (simulating a crash
- * between rename() and retire): the successor S1 is published at the path and
- * gets its own key, but the original segment is never tombstoned. */
-list($out) = shared_segment_run($seg, '
-	apcu_rotate_segment();               /* -> S1 published, retire skipped */
-	apcu_store("only_in_successor", "in-S1");
-	echo "published successor, orig migrated: ", var_export(apcu_fetch("orig"), true), "\n";
-', '8M', ['apc.enable_cli=1'], TRUE /* skip_retire */);
-echo $out, "\n";
-
-/* A fresh process now rotates normally. Because the original was never
- * tombstoned, without the segment-identity check it would rotate stale data
- * and discard S1 (losing "only_in_successor"). With the check it must adopt
- * S1 first, so both keys survive into the new successor. */
-list($out) = shared_segment_run($seg, '
+/* Process A creates segment O, stores a key, then stays alive holding O's
+ * mapping (so O is never re-created and A keeps mapping the pre-crash
+ * segment). It rotates only after signalled. */
+$code = '
+	apcu_store("orig", "in-original");
+	echo "ready\n"; fflush(STDOUT);
+	fgets(STDIN);              /* wait until a successor has been published */
 	$migrated = apcu_rotate_segment();
-	echo "second rotate migrated: ", $migrated, "\n";
-	echo "orig: ", var_export(apcu_fetch("orig"), true), "\n";
-	echo "only_in_successor: ", var_export(apcu_fetch("only_in_successor"), true), "\n";
-');
-echo $out, "\n";
+	echo "A rotate migrated: ", $migrated, "\n";
+	echo "A sees orig: ", var_export(apcu_fetch("orig"), true), "\n";
+	echo "A sees only_in_successor: ", var_export(apcu_fetch("only_in_successor"), true), "\n";
+';
+$proc = proc_open(shared_segment_cmd($seg, $code), [
+	0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w'],
+], $pipes);
+echo fgets($pipes[1]); /* "ready" — A holds O */
+
+/* Process B attaches to O and rotates with the retire step suppressed
+ * (simulated crash between rename and retire): successor S1 is published at
+ * the path (carrying O's migrated "orig"), O is NOT tombstoned, B stores a
+ * key that only exists in S1, then exits. */
+list($out) = shared_segment_run($seg, '
+	apcu_rotate_segment();
+	apcu_store("only_in_successor", "in-S1");
+', '8M', [], TRUE /* skip_retire */);
+echo $out;
+
+/* Now A (still mapping O, which was never tombstoned) rotates. Its retired
+ * check is false, so only the segment-id identity check can save it: it must
+ * notice the path holds S1 (different id), adopt S1, and rotate THAT — so both
+ * keys survive. Without the check A would rotate stale O and discard S1. */
+fwrite($pipes[0], "go\n");
+fclose($pipes[0]);
+echo stream_get_contents($pipes[1]);
+fclose($pipes[1]); fclose($pipes[2]); proc_close($proc);
 
 shared_segment_cleanup($seg);
 ?>
 ===DONE===
 --EXPECT--
-published successor, orig migrated: 'in-original'
-second rotate migrated: 2
-orig: 'in-original'
-only_in_successor: 'in-S1'
+ready
+A rotate migrated: 2
+A sees orig: 'in-original'
+A sees only_in_successor: 'in-S1'
 ===DONE===
