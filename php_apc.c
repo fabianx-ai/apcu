@@ -374,12 +374,16 @@ static PHP_RINIT_FUNCTION(apcu)
 }
 
 #if defined(APC_MMAP) && !defined(ZTS)
-/* During rotation the successor segment must not evict what we migrate;
- * a failed allocation simply ends the best-effort migration. */
+/* During rotation the successor segment must not evict what we migrate; a
+ * failed allocation simply ends the best-effort migration. The expunge
+ * return value has retry semantics in apc_sma_malloc: 0 means "another
+ * expunge already ran, try allocating again", so an unconditional 0 loops
+ * forever once the segment is full. Returning 1 ("I expunged what I could")
+ * makes the failed allocation final. */
 static zend_bool apc_shared_rotation_noop_expunge(void *data, size_t size) {
 	(void)data;
 	(void)size;
-	return 0;
+	return 1;
 }
 #endif
 
@@ -443,7 +447,7 @@ PHP_FUNCTION(apcu_rotate_segment)
 
 	ZEND_PARSE_PARAMETERS_START(0, 2)
 		Z_PARAM_OPTIONAL
-		Z_PARAM_LONG_OR_NULL(new_size, size_is_null)
+		Z_PARAM_LONG_EX(new_size, size_is_null, 1, 0) /* nullable; PHP 7 compatible */
 		Z_PARAM_BOOL(migrate)
 	ZEND_PARSE_PARAMETERS_END();
 
@@ -464,6 +468,13 @@ PHP_FUNCTION(apcu_rotate_segment)
 	}
 	if (!apc_sma.shared_mode) {
 		php_error_docref(NULL, E_WARNING, "apcu_rotate_segment requires apc.mmap_shared_file");
+		RETURN_FALSE;
+	}
+	if (APCG(entry_level) > 0) {
+		/* apcu_entry() holds the cache lock across its callback; migrating
+		 * under it would self-deadlock and swapping the mapping would make
+		 * the epilogue unlock the wrong segment's lock. */
+		php_error_docref(NULL, E_WARNING, "apcu_rotate_segment cannot be called inside apcu_entry()");
 		RETURN_FALSE;
 	}
 
@@ -567,6 +578,12 @@ PHP_FUNCTION(apcu_segment_refresh)
 
 #if defined(APC_MMAP) && !defined(ZTS)
 	if (!APCG(enabled) || !APCG(initialized) || !apc_sma.shared_mode) {
+		RETURN_FALSE;
+	}
+	if (APCG(entry_level) > 0) {
+		/* swapping the mapping under apcu_entry() would make its epilogue
+		 * unlock the wrong segment's lock */
+		php_error_docref(NULL, E_WARNING, "apcu_segment_refresh cannot be called inside apcu_entry()");
 		RETURN_FALSE;
 	}
 	apc_shared_segment_refresh();
