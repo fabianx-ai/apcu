@@ -19,6 +19,7 @@ $seg = shared_segment_path('002');
  * apc.shm_size must be refused, not clobbered. */
 shared_segment_cleanup($seg);
 file_put_contents($seg, random_bytes(2 * 1024 * 1024));
+chmod($seg, 0600); /* planted files must not trip the group/world-writable refusal (umask-proof) */
 list($out, $status) = shared_segment_run($seg, 'apcu_store("x", 1);');
 echo "garbage wrong size: ", (strpos($out, 'contains no valid segment') !== false && $status !== 0) ? 'refused' : "UNEXPECTED: $out", "\n";
 
@@ -26,6 +27,7 @@ echo "garbage wrong size: ", (strpos($out, 'contains no valid segment') !== fals
  * that crashed before completing; it is safely re-initialized. */
 shared_segment_cleanup($seg);
 file_put_contents($seg, str_repeat("\0", 8 * 1024 * 1024));
+chmod($seg, 0600); /* planted files must not trip the group/world-writable refusal (umask-proof) */
 list($out) = shared_segment_run($seg, 'var_dump(apcu_store("x", 1) && apcu_fetch("x") === 1);');
 echo "crashed-init recovery: ", trim($out), "\n";
 

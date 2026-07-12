@@ -20,6 +20,7 @@ $seg = shared_segment_path('011');
  * warns and runs on a private (unshared) segment — still functional. */
 shared_segment_cleanup($seg);
 file_put_contents($seg, random_bytes(2 * 1024 * 1024)); /* 2M != 8M shm_size */
+chmod($seg, 0600); /* planted files must not trip the group/world-writable refusal (umask-proof) */
 
 list($out, $status) = shared_segment_run($seg, '
 	var_dump(apcu_store("k", "v") && apcu_fetch("k") === "v");
