@@ -467,8 +467,24 @@ PHP_APCU_API void apc_sma_init(apc_sma_t* sma, void** data, apc_sma_expunge_f ex
 			if (sma->shmaddr && existed) {
 				sma_header_t *smaheader = sma->shmaddr;
 				apc_shared_seg_info_t *info = &smaheader->shared_info;
+				sma_header_t header_copy;
+				int prc = apc_mmap_shared_pread(&header_copy, sizeof(header_copy), 0);
 
-				if (info->magic == APC_SHARED_SEG_MAGIC) {
+				/* Decide what this file is from a pread() copy of its header,
+				 * never from the mapping: on a sparse crashed-init file over a
+				 * full filesystem the very first mapped read raises SIGBUS
+				 * (the page allocation fails at fault time), which would make
+				 * the reserve-before-reinit below unreachable. pread() reads
+				 * holes as zeros without allocating. Once the ready-magic is
+				 * confirmed, the creator's reservation completed before the
+				 * magic was stamped, so reads through the mapping are safe. */
+				if (prc != 0) {
+					snprintf(err, sizeof(err),
+						"cannot read the segment header of %s: %s", shared_file, strerror(prc));
+					apc_mmap_shared_release_lock();
+					apc_unmap(sma->shmaddr, mapped_size);
+					sma->shmaddr = NULL;
+				} else if (header_copy.shared_info.magic == APC_SHARED_SEG_MAGIC) {
 					/* Fully initialized segment from another process: validate
 					 * compatibility, then attach without touching shm state. */
 					if (apc_sma_shared_validate(sma->shmaddr, mapped_size)) {

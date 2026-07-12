@@ -275,16 +275,24 @@ void *apc_mmap_shared(char *file_path, size_t *size, zend_bool *existed, char *e
 	}
 
 	if (st.st_size == 0) {
-		/* Fresh file: this process becomes the creator at the desired size. */
+		/* Fresh file: this process becomes the creator at the desired size.
+		 * On failure, unlink what we created (the flock + inode check above
+		 * prove the path still names our file): a leftover sized-but-sparse
+		 * file would poison later attachers, which cannot even read its
+		 * header on a full filesystem without SIGBUSing on page allocation.
+		 * A process blocked in flock() on the unlinked inode re-runs the
+		 * inode-vs-path check, retries, and becomes a fresh creator. */
 		*existed = 0;
 		if (ftruncate(fd, *size) < 0) {
 			snprintf(errbuf, errlen, "ftruncate on %s failed: %s", file_path, strerror(errno));
+			unlink(file_path);
 			close(fd);
 			return NULL;
 		}
 		rc = apc_mmap_reserve(fd, *size);
 		if (rc != 0) {
 			snprintf(errbuf, errlen, "cannot reserve %zu bytes for %s: %s", *size, file_path, strerror(rc));
+			unlink(file_path);
 			close(fd);
 			return NULL;
 		}
@@ -299,6 +307,9 @@ void *apc_mmap_shared(char *file_path, size_t *size, zend_bool *existed, char *e
 	shmaddr = mmap(NULL, *size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NOSYNC, fd, 0);
 	if (shmaddr == MAP_FAILED) {
 		snprintf(errbuf, errlen, "failed to mmap %zu bytes of %s (apc.shm_size may be too large)", *size, file_path);
+		if (!*existed) {
+			unlink(file_path);
+		}
 		close(fd);
 		return NULL;
 	}
@@ -313,6 +324,30 @@ int apc_mmap_shared_reserve_current(size_t size)
 		return 0;
 	}
 	return apc_mmap_reserve(apc_mmap_shared_lock_fd, size);
+}
+
+/*
+ * Reads from the shared segment's locked fd without touching the mapping.
+ * pread() returns zeros for holes in a sparse file without allocating
+ * backing pages, so unlike a read through the mapping it cannot SIGBUS on a
+ * crashed-init segment sitting on a full filesystem. Returns 0 or an errno;
+ * a file shorter than the requested range is reported as EIO.
+ */
+int apc_mmap_shared_pread(void *buf, size_t len, size_t offset)
+{
+	ssize_t n;
+
+	if (apc_mmap_shared_lock_fd == -1) {
+		return EBADF;
+	}
+	n = pread(apc_mmap_shared_lock_fd, buf, len, (off_t)offset);
+	if (n < 0) {
+		return errno;
+	}
+	if ((size_t)n != len) {
+		return EIO;
+	}
+	return 0;
 }
 
 void apc_mmap_shared_release_lock(void)

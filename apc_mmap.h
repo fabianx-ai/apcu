@@ -55,6 +55,11 @@ void *apc_mmap_shared(char *file_path, size_t *size, zend_bool *existed, char *e
  * crashed-init recovery path, where the file exists but may be sparse). Returns
  * 0 on success or when unsupported, else an errno-like value. */
 int apc_mmap_shared_reserve_current(size_t size);
+/* Read from the currently-locked shared segment file via pread(), which reads
+ * sparse holes as zeros without allocating pages (a read through the mapping
+ * would SIGBUS on a crashed-init file over a full filesystem). Returns 0 or an
+ * errno; a file shorter than the requested range reports EIO. */
+int apc_mmap_shared_pread(void *buf, size_t len, size_t offset);
 void apc_mmap_shared_release_lock(void);
 
 /* Rotation support: map the current segment file as-is / build a successor. */
