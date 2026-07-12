@@ -56,22 +56,21 @@
 #endif
 
 /* Defined in apc_persist.c */
-apc_cache_entry_t *apc_persist(
-		apc_sma_t *sma, apc_serializer_t *serializer, zend_string *key, const zval *val);
-apc_cache_entry_t *apc_persist_ex(
-		apc_sma_t *sma, apc_serializer_t *serializer, zend_string *key, const zval *val,
+apc_cache_entry_data_t *apc_persist_data_ex(
+		apc_sma_t *sma, apc_serializer_t *serializer, const zval *val,
 		unsigned char *serialized_str, size_t serialized_str_len, zend_string *ei);
 zend_bool apc_persist_serialize_value(
 		apc_serializer_t *serializer, const zval *zv,
 		unsigned char **buf, size_t *buf_len);
-zend_bool apc_entry_value_identical(
-		const apc_cache_entry_t *entry, const zval *val,
+zend_bool apc_data_value_identical(
+		const apc_cache_entry_data_t *data, const zval *val,
 		const unsigned char *serialized_str, size_t serialized_str_len);
-zend_bool apc_entry_payloads_identical(
-		const apc_cache_entry_t *a, const apc_cache_entry_t *b);
-zend_bool apc_entry_ei_matches(const apc_cache_entry_t *entry, const zend_string *ei);
-zend_string *apc_entry_fetch_ei(const apc_cache_entry_t *entry);
-zend_bool apc_unpersist(zval *dst, const apc_cache_entry_t *entry, apc_serializer_t *serializer);
+zend_bool apc_data_payloads_identical(
+		const apc_cache_entry_data_t *a, const apc_cache_entry_data_t *b);
+zend_bool apc_data_ei_matches(const apc_cache_entry_data_t *data, const zend_string *ei);
+zend_string *apc_data_fetch_ei(const apc_cache_entry_data_t *data);
+zend_bool apc_unpersist(zval *dst, const apc_cache_entry_data_t *data, apc_serializer_t *serializer);
+apc_cache_entry_t *apc_persist_alloc_entry(apc_sma_t *sma, zend_string *key);
 
 /* make_prime */
 static int const primes[] = {
@@ -138,6 +137,29 @@ static inline void free_entry(apc_cache_t *cache, apc_cache_entry_t *entry) {
 	apc_sma_free(cache->sma, entry);
 }
 
+static inline void free_data(apc_cache_t *cache, apc_cache_entry_data_t *data) {
+	apc_sma_free(cache->sma, data);
+}
+
+/* Detach a data block from its entry (under write lock). The block is freed
+ * immediately when no reader holds a reference — the write lock excludes new
+ * references. Otherwise it is parked on the data gc list until they drain. */
+static void apc_cache_wlocked_detach_data(apc_cache_t *cache, apc_cache_entry_data_t *data)
+{
+	if (cache->header->mem_size) {
+		cache->header->mem_size -= data->mem_size;
+	}
+
+	data->owner = 0;
+	if (data->ref_count <= 0) {
+		free_data(cache, data);
+	} else {
+		data->dtime = time(0);
+		data->gc_next = cache->header->gc_data;
+		cache->header->gc_data = DATAOF(data);
+	}
+}
+
 /* These calculations can and should be done outside of a lock */
 static inline void apc_cache_hash_slot(
 		apc_cache_t* cache, zend_string *key, size_t* slot) {
@@ -170,19 +192,40 @@ static zend_bool apc_cache_entry_expired(
 		|| apc_cache_entry_soft_expired(cache, entry, t);
 }
 
-/* apc_cache_wlocked_move_entry() is called during defragmentation, before an entry is moved to a new position. */
-static zend_bool apc_cache_wlocked_move_entry(apc_cache_t *cache, apc_cache_entry_t *old, apc_cache_entry_t *new) {
+/* apc_cache_wlocked_move_block() is called during defragmentation, before a
+ * block (an entry or an entry's data block) is moved to a new position. */
+static zend_bool apc_cache_wlocked_move_block(apc_cache_t *cache, void *old, void *new, zend_bool is_data) {
+	if (is_data) {
+		apc_cache_entry_data_t *data = old;
+
+		/* Readers hold raw pointers into referenced blocks, and detached
+		 * blocks are linked from the gc list by address; both are unmovable. */
+		if (data->ref_count > 0 || !data->owner) {
+			return 0;
+		}
+
+		ENTRYAT(data->owner)->data = DATAOF(new);
+		return 1;
+	}
+
+	apc_cache_entry_t *entry = old;
+
 	/* Check if the entry can be moved. */
-	if (old->ref_count > 0) {
+	if (entry->ref_count > 0) {
 		return 0;
 	}
 
 	/* Change all references to this entry to the new position.
 	 * Since “next” is the 1st field of apc_cache_entry_t, the head pointer of the list
-	 * can be changed like a previous entry via ENTRYAT(old->prev)->next. */
-	ENTRYAT(old->prev)->next = ENTRYOF(new);
-	if (old->next) {
-		ENTRYAT(old->next)->prev = ENTRYOF(new);
+	 * can be changed like a previous entry via ENTRYAT(entry->prev)->next. */
+	ENTRYAT(entry->prev)->next = ENTRYOF(new);
+	if (entry->next) {
+		ENTRYAT(entry->next)->prev = ENTRYOF(new);
+	}
+
+	/* The entry's data block points back at it. */
+	if (entry->data) {
+		ENTRY_DATA(entry)->owner = ENTRYOF(new);
 	}
 
 	return 1;
@@ -214,6 +257,12 @@ static void apc_cache_wlocked_remove_entry(apc_cache_t *cache, apc_cache_entry_t
     /* unlink entry from list */
 	apc_cache_wlocked_unlink_entry(cache, entry);
 
+	/* detach the entry's value */
+	if (entry->data) {
+		apc_cache_wlocked_detach_data(cache, ENTRY_DATA(entry));
+		entry->data = 0;
+	}
+
 	/* adjust header info */
 	if (cache->header->mem_size)
 		cache->header->mem_size -= entry->mem_size;
@@ -238,11 +287,34 @@ static void apc_cache_wlocked_gc(apc_cache_t* cache)
 	 * list for more than cache->gc_ttl seconds
 	 *   (we issue a warning in the latter case).
 	 */
-	if (!cache->header->gc) {
+	if (!cache->header->gc && !cache->header->gc_data) {
 		return;
 	}
 
 	time_t now = time(0);
+
+	/* data blocks parked while readers were still copying from them */
+	uintptr_t *data_offset = &cache->header->gc_data;
+	while (*data_offset) {
+		apc_cache_entry_data_t *data = DATAAT(*data_offset);
+		time_t gc_sec = cache->gc_ttl ? (now - data->dtime) : 0;
+
+		if (data->ref_count > 0 && gc_sec <= (time_t)cache->gc_ttl) {
+			data_offset = &data->gc_next;
+			continue;
+		}
+
+		if (data->ref_count > 0) {
+			apc_debug(
+				"GC data block was on gc-list for %lld seconds",
+				(long long) gc_sec
+			);
+		}
+
+		/* set next and free current block */
+		*data_offset = data->gc_next;
+		free_data(cache, data);
+	}
 
 	uintptr_t *entry_offset = &cache->header->gc;
 	while (*entry_offset) {
@@ -353,6 +425,7 @@ PHP_APCU_API apc_cache_t* apc_cache_create(apc_sma_t* sma, apc_serializer_t* ser
 	cache->header->ndefragmentations = 0;
 	cache->header->nexpunges = 0;
 	cache->header->gc = 0;
+	cache->header->gc_data = 0;
 	cache->header->stime = time(NULL);
 
 	/* set cache options */
@@ -371,14 +444,13 @@ PHP_APCU_API apc_cache_t* apc_cache_create(apc_sma_t* sma, apc_serializer_t* ser
 	return cache;
 }
 
-static inline zend_bool apc_cache_wlocked_insert(
-		apc_cache_t *cache, apc_cache_entry_t *new_entry, zend_bool exclusive, zend_bool *skipped) {
-	zend_string *key = &new_entry->key;
-	time_t t = new_entry->ctime;
+/* Walk the slot for key, removing expired entries along the way (runtime
+ * cleanup, as before). Returns the live matching entry, or NULL with *tail
+ * set to the link a new entry should be inserted at. A hard-expired matching
+ * entry is removed and reported as absent. */
+static apc_cache_entry_t *apc_cache_wlocked_find_slot(
+		apc_cache_t *cache, zend_string *key, time_t t, uintptr_t **tail) {
 	size_t s;
-
-	/* process deleted list  */
-	apc_cache_wlocked_gc(cache);
 
 	/* calculate hash and slot */
 	apc_cache_hash_slot(cache, key, &s);
@@ -389,46 +461,13 @@ static inline zend_bool apc_cache_wlocked_insert(
 
 		/* check for a match by hash and string */
 		if (apc_entry_key_equals(entry, key)) {
-			/*
-			 * At this point we have found the user cache entry.  If we are doing
-			 * an exclusive insert (apc_add) we are going to bail right away if
-			 * the user entry already exists and is not hard expired.
-			 */
-			if (exclusive && !apc_cache_entry_hard_expired(entry, t)) {
-				return 0;
+			if (apc_cache_entry_hard_expired(entry, t)) {
+				apc_cache_wlocked_remove_entry(cache, entry);
+				continue;
 			}
 
-			/*
-			 * Skip-aware inserts re-check identity under the write lock; the
-			 * caller frees the unused new entry.
-			 */
-			if (skipped && !apc_cache_entry_hard_expired(entry, t)) {
-				if (new_entry->ei) {
-					/* apc_cache_add_ei: a live entry with a matching expiration
-					 * identifier is left completely untouched, add-style. */
-					const zend_string *new_ei =
-						(const zend_string *)((const char *) new_entry + new_entry->ei);
-
-					if (apc_entry_ei_matches(entry, new_ei)) {
-						cache->header->nskipped++;
-						*skipped = 1;
-						return 1;
-					}
-				} else if (apc_entry_payloads_identical(entry, new_entry)) {
-					/* apc_cache_store_if_changed: an identical value has its
-					 * metadata refreshed as a store would. */
-					entry->ttl = new_entry->ttl;
-					entry->ctime = new_entry->ctime;
-					entry->mtime = new_entry->mtime;
-					entry->atime = new_entry->atime;
-					cache->header->nskipped++;
-					*skipped = 1;
-					return 1;
-				}
-			}
-
-			apc_cache_wlocked_remove_entry(cache, entry);
-			break;
+			*tail = NULL;
+			return entry;
 		}
 
 		/*
@@ -444,56 +483,100 @@ static inline zend_bool apc_cache_wlocked_insert(
 		entry_offset = &entry->next;
 	}
 
-	/* link in new entry */
-	apc_cache_wlocked_link_entry(cache, entry_offset, new_entry);
-
-	cache->header->mem_size += new_entry->mem_size;
-	cache->header->nentries++;
-	cache->header->ninserts++;
-
-	return 1;
+	*tail = entry_offset;
+	return NULL;
 }
 
-static void apc_cache_set_entry_values(apc_cache_entry_t *entry, const zend_long ttl, const time_t t)
-{
+/* Attach a data block to an entry and refresh the entry's metadata exactly as
+ * storing always did. Replaces (detaches) the previous value in place: no list
+ * surgery, the entry and its key are untouched (GH #346). */
+static void apc_cache_wlocked_attach_data(
+		apc_cache_t *cache, apc_cache_entry_t *entry, apc_cache_entry_data_t *data,
+		const zend_long ttl, const time_t t) {
+	if (entry->data) {
+		apc_cache_wlocked_detach_data(cache, ENTRY_DATA(entry));
+	}
+
+	entry->data = DATAOF(data);
+	data->owner = ENTRYOF(entry);
+	cache->header->mem_size += data->mem_size;
+	cache->header->ninserts++;
+
 	entry->ttl = ttl;
-	entry->next = 0;
-	entry->prev = 0;
 	entry->nhits = 0;
 	entry->ctime = t;
 	entry->mtime = t;
 	entry->atime = t;
 	entry->dtime = 0;
+
+	/* Drop the creation reference: the entry owns the block now, and the
+	 * reference count only tracks readers. */
+	data->ref_count--;
 }
+
+/* Link a freshly allocated entry (with its creation reference still held) at
+ * tail and attach data to it. */
+static void apc_cache_wlocked_insert_entry(
+		apc_cache_t *cache, uintptr_t *tail, apc_cache_entry_t *entry,
+		apc_cache_entry_data_t *data, const zend_long ttl, const time_t t) {
+	apc_cache_wlocked_link_entry(cache, tail, entry);
+
+	cache->header->mem_size += entry->mem_size;
+	cache->header->nentries++;
+
+	apc_cache_wlocked_attach_data(cache, entry, data, ttl, t);
+
+	/* drop the creation reference of the entry block */
+	entry->ref_count--;
+}
+
 
 /* TODO This function may lead to a deadlock on expunge */
 static inline zend_bool apc_cache_wlocked_store_internal(
 		apc_cache_t *cache, zend_string *key, const zval *val,
 		const zend_long ttl, const zend_bool exclusive) {
 	time_t t = apc_time();
+	uintptr_t *tail;
+	apc_cache_entry_t *entry;
+	apc_cache_entry_data_t *data;
 
 	if (apc_cache_defense(cache, key, t)) {
 		return 0;
 	}
 
-	/* create entry in the shared memory */
-	apc_cache_entry_t *entry = apc_persist(cache->sma, cache->serializer, key, val);
+	/* process deleted lists */
+	apc_cache_wlocked_gc(cache);
+
+	/* create the value in the shared memory */
+	data = apc_persist_data_ex(cache->sma, cache->serializer, val, NULL, 0, NULL);
+	if (!data) {
+		return 0;
+	}
+
+	entry = apc_cache_wlocked_find_slot(cache, key, t, &tail);
+	if (entry) {
+		if (exclusive) {
+			free_data(cache, data);
+			return 0;
+		}
+
+		apc_cache_wlocked_attach_data(cache, entry, data, ttl, t);
+		return 1;
+	}
+
+	entry = apc_persist_alloc_entry(cache->sma, key);
 	if (!entry) {
+		free_data(cache, data);
 		return 0;
 	}
 
-	/* init remaining values of the entry */
-	apc_cache_set_entry_values(entry, ttl, t);
-
-	/* execute an insertion */
-	if (!apc_cache_wlocked_insert(cache, entry, exclusive, NULL)) {
-		free_entry(cache, entry);
-		return 0;
+	/* The allocations above may have expunged the cache; re-walk the slot to
+	 * get a valid tail (the key cannot have appeared: we hold the lock). */
+	if (apc_cache_wlocked_find_slot(cache, key, t, &tail)) {
+		ZEND_UNREACHABLE();
 	}
 
-	/* release entry, because the ref_count of a new entry is initialized to 1 during allocation */
-	apc_cache_entry_release(cache, entry);
-
+	apc_cache_wlocked_insert_entry(cache, tail, entry, data, ttl, t);
 	return 1;
 }
 
@@ -569,53 +652,141 @@ static inline apc_cache_entry_t *apc_cache_rlocked_find_incref(
 	return entry;
 }
 
-PHP_APCU_API zend_bool apc_cache_store(
+/* The shared store engine: persists the value outside the lock, then attaches
+ * it under the write lock — in place for an existing key, linking a fresh
+ * entry otherwise. Mode-specific behavior:
+ *   - exclusive (apcu_add): fails on a live entry.
+ *   - skipped != NULL, ei == NULL (apcu_update): an identical live value is
+ *     not replaced; its metadata is refreshed and *skipped is set.
+ *   - skipped != NULL, ei != NULL (apcu_add_ei): a live entry with matching
+ *     identifier is left completely untouched and *skipped is set.
+ * Takes ownership of serialized_str. Returns true when stored or skipped. */
+static zend_bool apc_cache_store_ex(
 		apc_cache_t* cache, zend_string *key, const zval *val,
-		const zend_long ttl, const zend_bool exclusive) {
+		const zend_long ttl, const zend_bool exclusive,
+		zend_string *ei, unsigned char *serialized_str, size_t serialized_str_len,
+		zend_bool *skipped) {
 	time_t t = apc_time();
 	zend_bool ret = 0;
-
-	if (!cache) {
-		return 0;
-	}
+	zend_bool done = 0;
+	apc_cache_entry_t *new_entry = NULL;
+	apc_cache_entry_data_t *data;
 
 	/* run cache defense */
 	if (apc_cache_defense(cache, key, t)) {
-		return 0;
-	}
-
-	/* create entry in the shared memory */
-	apc_cache_entry_t *entry = apc_persist(cache->sma, cache->serializer, key, val);
-	if (!entry) {
-		return 0;
-	}
-
-	/* init remaining values of the entry */
-	apc_cache_set_entry_values(entry, ttl, t);
-
-	/* execute an insertion */
-	if (!apc_cache_wlock(cache)) {
-		free_entry(cache, entry);
-		return 0;
-	}
-
-	php_apc_try {
-		ret = apc_cache_wlocked_insert(cache, entry, exclusive, NULL);
-	} php_apc_finally {
-		apc_cache_wunlock(cache);
-
-		if (ret) {
-			/* release entry, because the ref_count of a new entry is initialized to 1 during allocation */
-			apc_cache_entry_release(cache, entry);
-		} else {
-			/* the entry mustn't be released before it is freed to prevent defragmentation from moving the entry */
-			free_entry(cache, entry);
+		if (serialized_str) {
+			efree(serialized_str);
 		}
-	} php_apc_end_try();
+		return 0;
+	}
+
+	/* create the value in the shared memory (takes ownership of serialized_str) */
+	data = apc_persist_data_ex(
+		cache->sma, cache->serializer, val, serialized_str, serialized_str_len, ei);
+	if (!data) {
+		return 0;
+	}
+
+	/* Peek at existence under the read lock to decide whether an entry block
+	 * is needed, so that both the fresh-insert and the in-place-update path
+	 * take the write lock exactly once. A lost race is handled below by
+	 * retrying with (or discarding) the separately allocated block. */
+	if (apc_cache_rlock(cache)) {
+		zend_bool absent = apc_cache_rlocked_find_nostat(cache, key, t) == NULL;
+		apc_cache_runlock(cache);
+
+		if (absent) {
+			new_entry = apc_persist_alloc_entry(cache->sma, key);
+			if (!new_entry) {
+				free_data(cache, data);
+				return 0;
+			}
+		}
+	}
+
+	while (!done) {
+		done = 1;
+
+		if (!apc_cache_wlock(cache)) {
+			break;
+		}
+
+		php_apc_try {
+			uintptr_t *tail;
+			apc_cache_entry_t *entry;
+
+			/* process deleted lists */
+			apc_cache_wlocked_gc(cache);
+
+			entry = apc_cache_wlocked_find_slot(cache, key, t, &tail);
+			if (entry) {
+				if (exclusive) {
+					/* a live entry exists: apcu_add fails */
+				} else if (skipped && ei && apc_data_ei_matches(ENTRY_DATA(entry), ei)) {
+					/* apcu_add_ei: identifier already present — strict no-op */
+					cache->header->nskipped++;
+					*skipped = 1;
+					ret = 1;
+				} else if (skipped && !ei
+						&& apc_data_payloads_identical(ENTRY_DATA(entry), data)) {
+					/* apcu_update: identical value — refresh metadata only */
+					entry->ttl = ttl;
+					entry->ctime = t;
+					entry->mtime = t;
+					entry->atime = t;
+					cache->header->nskipped++;
+					*skipped = 1;
+					ret = 1;
+				} else {
+					apc_cache_wlocked_attach_data(cache, entry, data, ttl, t);
+					ret = 1;
+				}
+			} else if (new_entry) {
+				apc_cache_wlocked_insert_entry(cache, tail, new_entry, data, ttl, t);
+				new_entry = NULL;
+				ret = 1;
+			} else {
+				/* The entry block must be allocated outside the lock (the
+				 * allocation may trigger an expunge, which takes the write
+				 * lock); retry with it in hand. */
+				done = 0;
+			}
+		} php_apc_finally {
+			apc_cache_wunlock(cache);
+		} php_apc_end_try();
+
+		if (!done) {
+			new_entry = apc_persist_alloc_entry(cache->sma, key);
+			if (!new_entry) {
+				break;
+			}
+		}
+	}
+
+	if (!ret || (skipped && *skipped)) {
+		/* failed or unused candidate value; it was never attached, so free it */
+		free_data(cache, data);
+	}
+	if (new_entry) {
+		/* lost the existence race; the separately allocated entry block is unused */
+		free_entry(cache, new_entry);
+	}
 
 	return ret;
 }
 
+PHP_APCU_API zend_bool apc_cache_store(
+		apc_cache_t* cache, zend_string *key, const zval *val,
+		const zend_long ttl, const zend_bool exclusive) {
+	if (!cache) {
+		return 0;
+	}
+
+	return apc_cache_store_ex(cache, key, val, ttl, exclusive, NULL, NULL, 0, NULL);
+}
+
+/* Find the live entry for key and, when its value is identical to the candidate,
+ * refresh its metadata as if it had been stored. Must be called under write lock. */
 /* Find the live entry for key and, when its value is identical to the candidate,
  * refresh its metadata as if it had been stored. Must be called under write lock. */
 static zend_bool apc_cache_wlocked_refresh_identical(
@@ -624,7 +795,8 @@ static zend_bool apc_cache_wlocked_refresh_identical(
 		const zend_long ttl, time_t t) {
 	apc_cache_entry_t *entry = apc_cache_rlocked_find_nostat(cache, key, t);
 
-	if (!entry || !apc_entry_value_identical(entry, val, serialized_str, serialized_str_len)) {
+	if (!entry || !apc_data_value_identical(
+			ENTRY_DATA(entry), val, serialized_str, serialized_str_len)) {
 		return 0;
 	}
 
@@ -643,8 +815,6 @@ PHP_APCU_API zend_bool apc_cache_store_if_changed(
 	size_t serialized_str_len = 0;
 	zend_bool have_compare_form = 0;
 	zend_bool skipped = 0;
-	zend_bool ret = 0;
-	apc_cache_entry_t *entry;
 
 	if (!cache) {
 		return 0;
@@ -652,7 +822,7 @@ PHP_APCU_API zend_bool apc_cache_store_if_changed(
 
 	/* Build a request-local comparison form where one exists without touching
 	 * shm: scalars and strings compare directly; objects (and arrays under an
-	 * explicit serializer) are serialized here — apc_persist_ex() below reuses
+	 * explicit serializer) are serialized here — the store engine below reuses
 	 * the buffer, so the store path serializes exactly once. Structurally
 	 * persisted arrays have no cheap comparison form and take the plain store
 	 * path (their identical stores are not skipped). */
@@ -662,7 +832,7 @@ PHP_APCU_API zend_bool apc_cache_store_if_changed(
 			|| (cache->serializer && Z_TYPE_P(val) == IS_ARRAY)) {
 		if (!apc_persist_serialize_value(
 				cache->serializer, val, &serialized_str, &serialized_str_len)) {
-			/* apc_persist() would fail the same way in apc_cache_store() */
+			/* the persist path inside the store engine would fail the same way */
 			return 0;
 		}
 		have_compare_form = 1;
@@ -688,47 +858,10 @@ PHP_APCU_API zend_bool apc_cache_store_if_changed(
 		}
 	}
 
-	/* run cache defense */
-	if (apc_cache_defense(cache, key, t)) {
-		if (serialized_str) {
-			efree(serialized_str);
-		}
-		return 0;
-	}
-
-	/* create entry in the shared memory (takes ownership of serialized_str) */
-	entry = apc_persist_ex(
-		cache->sma, cache->serializer, key, val, serialized_str, serialized_str_len, NULL);
-	if (!entry) {
-		return 0;
-	}
-
-	/* init remaining values of the entry */
-	apc_cache_set_entry_values(entry, ttl, t);
-
-	if (!apc_cache_wlock(cache)) {
-		free_entry(cache, entry);
-		return 0;
-	}
-
-	php_apc_try {
-		/* The stored value may have become identical to ours since the compare
-		 * above; the insert re-checks under the lock before replacing. */
-		ret = apc_cache_wlocked_insert(cache, entry, 0, &skipped);
-	} php_apc_finally {
-		apc_cache_wunlock(cache);
-
-		if (ret && !skipped) {
-			/* release entry, because the ref_count of a new entry is initialized to 1 during allocation */
-			apc_cache_entry_release(cache, entry);
-		} else {
-			/* unused (skipped) or failed candidate; it was never linked, so free it.
-			 * It mustn't be released first, to prevent defragmentation from moving it. */
-			free_entry(cache, entry);
-		}
-	} php_apc_end_try();
-
-	return ret;
+	/* The stored value may have become identical to ours since the compare
+	 * above; the store engine re-checks under the lock before replacing. */
+	return apc_cache_store_ex(
+		cache, key, val, ttl, 0, NULL, serialized_str, serialized_str_len, &skipped);
 }
 
 PHP_APCU_API zend_bool apc_cache_add_ei(
@@ -736,7 +869,6 @@ PHP_APCU_API zend_bool apc_cache_add_ei(
 		const zend_long ttl) {
 	time_t t = apc_time();
 	zend_bool skipped = 0;
-	zend_bool ret = 0;
 	apc_cache_entry_t *entry;
 
 	if (!cache) {
@@ -755,51 +887,21 @@ PHP_APCU_API zend_bool apc_cache_add_ei(
 	}
 
 	entry = apc_cache_rlocked_find_nostat(cache, key, t);
-	if (entry && apc_entry_ei_matches(entry, ei)) {
+	if (entry && apc_data_ei_matches(ENTRY_DATA(entry), ei)) {
 		ATOMIC_INC_RLOCKED(cache->header->nskipped);
 		apc_cache_runlock(cache);
 		return 0;
 	}
 	apc_cache_runlock(cache);
 
-	/* run cache defense */
-	if (apc_cache_defense(cache, key, t)) {
+	/* A concurrent writer may store the same identifier before we take the
+	 * write lock; the store engine re-checks under the lock before replacing. */
+	if (!apc_cache_store_ex(cache, key, val, ttl, 0, ei, NULL, 0, &skipped)) {
 		return 0;
 	}
-
-	/* create entry in the shared memory, tagged with the identifier */
-	entry = apc_persist_ex(cache->sma, cache->serializer, key, val, NULL, 0, ei);
-	if (!entry) {
-		return 0;
-	}
-
-	/* init remaining values of the entry */
-	apc_cache_set_entry_values(entry, ttl, t);
-
-	if (!apc_cache_wlock(cache)) {
-		free_entry(cache, entry);
-		return 0;
-	}
-
-	php_apc_try {
-		/* A concurrent writer may have stored the same identifier since the
-		 * check above; the insert re-checks under the lock before replacing. */
-		ret = apc_cache_wlocked_insert(cache, entry, 0, &skipped);
-	} php_apc_finally {
-		apc_cache_wunlock(cache);
-
-		if (ret && !skipped) {
-			/* release entry, because the ref_count of a new entry is initialized to 1 during allocation */
-			apc_cache_entry_release(cache, entry);
-		} else {
-			/* unused (skipped) or failed candidate; it was never linked, so free it.
-			 * It mustn't be released first, to prevent defragmentation from moving it. */
-			free_entry(cache, entry);
-		}
-	} php_apc_end_try();
 
 	/* add semantics: a skip means the identifier was already present */
-	return ret && !skipped;
+	return !skipped;
 }
 
 #ifndef ZTS
@@ -924,6 +1026,23 @@ PHP_APCU_API zend_bool apc_cache_preload(apc_cache_t* cache, const char *path)
 PHP_APCU_API void apc_cache_entry_incref(apc_cache_t *cache, apc_cache_entry_t *entry)
 {
 	ATOMIC_INC_RLOCKED(entry->ref_count);
+}
+
+/* Pin an entry's current data block for reading after the lock is released.
+ * Must be called under (at least) the read lock, which excludes swaps, so the
+ * observed block stays this entry's value while the lock is held and stays
+ * allocated as long as the pin is. */
+PHP_APCU_API apc_cache_entry_data_t *apc_cache_entry_data_incref(
+		apc_cache_t *cache, apc_cache_entry_t *entry)
+{
+	apc_cache_entry_data_t *data = ENTRY_DATA(entry);
+	ATOMIC_INC_RLOCKED(data->ref_count);
+	return data;
+}
+
+PHP_APCU_API void apc_cache_data_release(apc_cache_t *cache, apc_cache_entry_data_t *data)
+{
+	ATOMIC_DEC(data->ref_count);
 }
 
 PHP_APCU_API void apc_cache_entry_release(apc_cache_t *cache, apc_cache_entry_t *entry)
@@ -1065,7 +1184,7 @@ PHP_APCU_API zend_bool apc_cache_default_expunge(apc_cache_t* cache, size_t size
 	cache->header->ndefragmentations++;
 
 	/* run defragmentation to coalesce free blocks */
-	apc_sma_defrag(cache->sma, cache, (apc_sma_move_f)apc_cache_wlocked_move_entry);
+	apc_sma_defrag(cache->sma, cache, (apc_sma_move_f)apc_cache_wlocked_move_block);
 
 	/* if size bytes can't be allocated as a contiguous block after defragmentation, we do a real expunge */
 	if (!apc_sma_check_avail_contiguous(cache->sma, size)) {
@@ -1088,6 +1207,7 @@ end_lbl:
 PHP_APCU_API zend_bool apc_cache_fetch(apc_cache_t* cache, zend_string *key, time_t t, zval *dst)
 {
 	apc_cache_entry_t *entry;
+	apc_cache_entry_data_t *data;
 	zend_bool retval = 0;
 
 	if (!cache) {
@@ -1098,17 +1218,21 @@ PHP_APCU_API zend_bool apc_cache_fetch(apc_cache_t* cache, zend_string *key, tim
 		return 0;
 	}
 
-	entry = apc_cache_rlocked_find_incref(cache, key, t);
-	apc_cache_runlock(cache);
-
+	entry = apc_cache_rlocked_find(cache, key, t);
 	if (!entry) {
+		apc_cache_runlock(cache);
 		return 0;
 	}
 
+	/* Pin the value, not the entry: the entry's data pointer may be swapped
+	 * in place by a writer once the lock is released (GH #346). */
+	data = apc_cache_entry_data_incref(cache, entry);
+	apc_cache_runlock(cache);
+
 	php_apc_try {
-		retval = apc_cache_entry_fetch_zval(cache, entry, dst);
+		retval = apc_cache_data_fetch_zval(cache, data, dst);
 	} php_apc_finally {
-		apc_cache_entry_release(cache, entry);
+		apc_cache_data_release(cache, data);
 	} php_apc_end_try();
 
 	return retval;
@@ -1152,8 +1276,8 @@ retry_update:
 	entry = apc_cache_rlocked_find_nostat(cache, key, t);
 	if (entry) {
 		/* Only allow changes to simple values */
-		if (Z_TYPE(entry->val) < IS_STRING) {
-			retval = updater(cache, entry, data);
+		if (Z_TYPE(ENTRY_DATA(entry)->val) < IS_STRING) {
+			retval = updater(cache, ENTRY_DATA(entry), data);
 			entry->mtime = t;
 		}
 
@@ -1199,9 +1323,10 @@ retry_update:
 
 	entry = apc_cache_rlocked_find_nostat(cache, key, t);
 	if (entry) {
-		/* Only supports integers */
-		if (Z_TYPE(entry->val) == IS_LONG) {
-			retval = updater(cache, &Z_LVAL(entry->val), data);
+		/* Only supports integers; the value is mutated in place inside the
+		 * data block, which cannot be swapped or moved under the read lock. */
+		if (Z_TYPE(ENTRY_DATA(entry)->val) == IS_LONG) {
+			retval = updater(cache, &Z_LVAL(ENTRY_DATA(entry)->val), data);
 			entry->mtime = t;
 		}
 
@@ -1264,10 +1389,10 @@ PHP_APCU_API zend_bool apc_cache_delete(apc_cache_t *cache, zend_string *key)
 	return 0;
 }
 
-PHP_APCU_API zend_bool apc_cache_entry_fetch_zval(
-		apc_cache_t *cache, apc_cache_entry_t *entry, zval *dst)
+PHP_APCU_API zend_bool apc_cache_data_fetch_zval(
+		apc_cache_t *cache, apc_cache_entry_data_t *data, zval *dst)
 {
-	return apc_unpersist(dst, entry, cache->serializer);
+	return apc_unpersist(dst, data, cache->serializer);
 }
 
 static inline void array_add_long(zval *array, zend_string *key, zend_long lval) {
@@ -1297,7 +1422,8 @@ static zval apc_cache_link_info(apc_cache_t *cache, apc_cache_entry_t *p)
 	array_add_long(&link, apc_str_deletion_time, p->dtime);
 	array_add_long(&link, apc_str_access_time, p->atime);
 	array_add_long(&link, apc_str_ref_count, p->ref_count);
-	array_add_long(&link, apc_str_mem_size, p->mem_size);
+	array_add_long(&link, apc_str_mem_size,
+		p->mem_size + (p->data ? ENTRY_DATA(p)->mem_size : 0));
 
 	return link;
 }
@@ -1418,8 +1544,8 @@ PHP_APCU_API void apc_cache_stat(apc_cache_t *cache, zend_string *key, zval *sta
 				array_add_long(stat, apc_str_deletion_time, entry->dtime);
 				array_add_long(stat, apc_str_ttl, entry->ttl);
 				array_add_long(stat, apc_str_refs, entry->ref_count);
-				if (entry->ei) {
-					zend_string *ei = apc_entry_fetch_ei(entry);
+				if (entry->data && ENTRY_DATA(entry)->ei) {
+					zend_string *ei = apc_data_fetch_ei(ENTRY_DATA(entry));
 					add_assoc_str(stat, "expiration_identifier", ei);
 				}
 				break;
@@ -1510,7 +1636,7 @@ PHP_APCU_API void apc_cache_entry(apc_cache_t *cache, zend_string *key, zend_fca
 				apc_cache_wlocked_store_internal(cache, key, return_value, ttl, 1);
 			}
 		} else {
-			apc_cache_entry_fetch_zval(cache, entry, return_value);
+			apc_cache_data_fetch_zval(cache, ENTRY_DATA(entry), return_value);
 			apc_cache_entry_release(cache, entry);
 		}
 	} php_apc_finally {

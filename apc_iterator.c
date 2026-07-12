@@ -46,7 +46,7 @@ zend_class_entry* apc_iterator_get_ce(void) {
 	}
 
 static apc_iterator_item_t* apc_iterator_item_ctor(
-		apc_iterator_t *iterator, apc_cache_entry_t *entry) {
+		apc_iterator_t *iterator, apc_cache_entry_t *entry, apc_cache_entry_data_t *data) {
 	zval zv;
 	HashTable *ht;
 	apc_iterator_item_t *item = ecalloc(1, sizeof(apc_iterator_item_t));
@@ -68,7 +68,12 @@ static apc_iterator_item_t* apc_iterator_item_ctor(
 
 	if (APC_ITER_VALUE & iterator->format) {
 		ZVAL_UNDEF(&zv);
-		apc_cache_entry_fetch_zval(apc_user_cache, entry, &zv);
+		if (data) {
+			apc_cache_data_fetch_zval(apc_user_cache, data, &zv);
+		} else {
+			/* detached (deleted-list) entries no longer carry their value */
+			ZVAL_NULL(&zv);
+		}
 		zend_hash_add_new(ht, apc_str_value, &zv);
 	}
 
@@ -99,7 +104,7 @@ static apc_iterator_item_t* apc_iterator_item_ctor(
 		zend_hash_add_new(ht, apc_str_ref_count, &zv);
 	}
 	if (APC_ITER_MEM_SIZE & iterator->format) {
-		ZVAL_LONG(&zv, entry->mem_size);
+		ZVAL_LONG(&zv, entry->mem_size + (data ? data->mem_size : 0));
 		zend_hash_add_new(ht, apc_str_mem_size, &zv);
 	}
 	if (APC_ITER_TTL & iterator->format) {
@@ -232,6 +237,9 @@ static size_t apc_iterator_fetch_active(apc_iterator_t *iterator) {
 							count++;
 							apc_stack_push(iterator->entries, entry);
 							apc_cache_entry_incref(cache, entry);
+							/* pin the value alongside: the entry's data pointer
+							 * may be swapped in place once the lock is dropped */
+							apc_stack_push(iterator->entries, apc_cache_entry_data_incref(cache, entry));
 						}
 					}
 					entry_offset = entry->next;
@@ -244,11 +252,17 @@ static size_t apc_iterator_fetch_active(apc_iterator_t *iterator) {
 		} php_apc_end_try();
 
 		/* Build the items with the lock released. */
-		for (i = 0; i < apc_stack_size(iterator->entries); i++) {
-			apc_stack_push(iterator->stack, apc_iterator_item_ctor(iterator, apc_stack_get(iterator->entries, i)));
+		for (i = 0; i < apc_stack_size(iterator->entries); i += 2) {
+			apc_stack_push(iterator->stack, apc_iterator_item_ctor(iterator,
+				apc_stack_get(iterator->entries, i),
+				apc_stack_get(iterator->entries, i + 1)));
 		}
 	} php_apc_finally {
 		while (apc_stack_size(iterator->entries) > 0) {
+			apc_cache_entry_data_t *data = apc_stack_pop(iterator->entries);
+			if (data) {
+				apc_cache_data_release(cache, data);
+			}
 			apc_cache_entry_release(cache, apc_stack_pop(iterator->entries));
 		}
 	} php_apc_end_try();
@@ -281,6 +295,8 @@ static size_t apc_iterator_fetch_deleted(apc_iterator_t *iterator) {
 					count++;
 					apc_stack_push(iterator->entries, entry);
 					apc_cache_entry_incref(cache, entry);
+					/* deleted-list entries are detached from their value */
+					apc_stack_push(iterator->entries, NULL);
 				}
 				entry_offset = entry->next;
 			}
@@ -290,11 +306,17 @@ static size_t apc_iterator_fetch_deleted(apc_iterator_t *iterator) {
 			apc_cache_runlock(cache);
 		} php_apc_end_try();
 
-		for (i = 0; i < apc_stack_size(iterator->entries); i++) {
-			apc_stack_push(iterator->stack, apc_iterator_item_ctor(iterator, apc_stack_get(iterator->entries, i)));
+		for (i = 0; i < apc_stack_size(iterator->entries); i += 2) {
+			apc_stack_push(iterator->stack, apc_iterator_item_ctor(iterator,
+				apc_stack_get(iterator->entries, i),
+				apc_stack_get(iterator->entries, i + 1)));
 		}
 	} php_apc_finally {
 		while (apc_stack_size(iterator->entries) > 0) {
+			apc_cache_entry_data_t *data = apc_stack_pop(iterator->entries);
+			if (data) {
+				apc_cache_data_release(cache, data);
+			}
 			apc_cache_entry_release(cache, apc_stack_pop(iterator->entries));
 		}
 	} php_apc_end_try();
@@ -319,7 +341,8 @@ static void apc_iterator_totals(apc_iterator_t *iterator) {
 				apc_cache_entry_t *entry = ENTRYAT(entry_offset);
 				if (apc_iterator_check_expiry(cache, entry, t)) {
 					if (apc_iterator_search_match(iterator, entry)) {
-						iterator->size += entry->mem_size;
+						iterator->size += entry->mem_size
+						+ (entry->data ? ENTRY_DATA(entry)->mem_size : 0);
 						iterator->hits += entry->nhits;
 						iterator->count++;
 					}

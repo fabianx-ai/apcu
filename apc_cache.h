@@ -46,6 +46,24 @@ struct apc_cache_slam_key_t {
 #endif
 };
 
+/*
+ * The value of an entry lives in its own allocation, so that updating an
+ * existing key replaces a pointer instead of relinking list nodes (GH #346).
+ * All pointers inside the payload (zval Z_PTR, ei) are offsets relative to
+ * the START OF THIS STRUCT; the block is relocatable as raw bytes.
+ * The (val, ei) pair is only ever swapped as a whole — see AddEi.tla.
+ */
+typedef struct apc_cache_entry_data_t apc_cache_entry_data_t;
+struct apc_cache_entry_data_t {
+	uintptr_t owner;         /* offset (from cache header) of the owning entry, 0 = detached */
+	uintptr_t gc_next;       /* next data block on the data gc list (only while detached) */
+	zend_long ref_count;     /* readers currently unpersisting from this block */
+	zend_long mem_size;      /* size of this allocation */
+	time_t dtime;            /* time the block was detached from its entry */
+	uintptr_t ei;            /* offset to the expiration identifier string, 0 if none */
+	zval val;                /* the zval copied at store time */
+};
+
 typedef struct apc_cache_entry_t apc_cache_entry_t;
 struct apc_cache_entry_t {
 	uintptr_t next;          /* offset to next entry (MUST BE THE 1st FIELD OF THE STRUCT!) */
@@ -57,9 +75,8 @@ struct apc_cache_entry_t {
 	time_t mtime;            /* the mtime of this cached entry */
 	time_t dtime;            /* time entry was removed from cache */
 	time_t atime;            /* time entry was last accessed */
-	zend_long mem_size;      /* memory used */
-	uintptr_t ei;            /* offset to the expiration identifier string, 0 if none */
-	zval val;                /* the zval copied at store time */
+	zend_long mem_size;      /* memory used by this block (the value is accounted separately) */
+	uintptr_t data;          /* offset (from cache header) of the entry's apc_cache_entry_data_t */
 	zend_string key;         /* entry key (MUST BE THE LAST FIELD OF THE STRUCT!) */
 };
 
@@ -78,6 +95,7 @@ typedef struct _apc_cache_header_t {
 	time_t stime;                   /* start time */
 	apc_cache_slam_key_t lastkey;   /* last key inserted (not necessarily without error) */
 	uintptr_t gc;                   /* offset in shm to the first entry of gc list */
+	uintptr_t gc_data;              /* offset in shm to the first detached data block of the data gc list */
 } apc_cache_header_t;
 
 typedef struct _apc_cache_t {
@@ -92,7 +110,7 @@ typedef struct _apc_cache_t {
 	zend_bool defend;             /* defense parameter for runtime */
 } apc_cache_t;
 
-typedef zend_bool (*apc_cache_updater_t)(apc_cache_t*, apc_cache_entry_t*, void* data);
+typedef zend_bool (*apc_cache_updater_t)(apc_cache_t*, apc_cache_entry_data_t*, void* data);
 
 typedef zend_bool (*apc_cache_atomic_updater_t)(apc_cache_t*, zend_long*, void* data);
 
@@ -210,10 +228,21 @@ PHP_APCU_API zend_bool apc_cache_exists(apc_cache_t* cache, zend_string *key, ti
 PHP_APCU_API zend_bool apc_cache_delete(apc_cache_t* cache, zend_string *key);
 
 /*
- * apc_cache_fetch_zval copies a cache entry value to be usable at runtime.
+ * apc_cache_data_fetch_zval copies a cached value to be usable at runtime.
+ * The data block must be pinned (apc_cache_entry_data_incref) or otherwise
+ * protected (a held lock) while this runs.
  */
-PHP_APCU_API zend_bool apc_cache_entry_fetch_zval(
-		apc_cache_t *cache, apc_cache_entry_t *entry, zval *dst);
+PHP_APCU_API zend_bool apc_cache_data_fetch_zval(
+		apc_cache_t *cache, apc_cache_entry_data_t *data, zval *dst);
+
+/*
+ * apc_cache_entry_data_incref pins an entry's current data block so it stays
+ * allocated (and unmoved) after the lock is released; must be called under at
+ * least the read lock. Release with apc_cache_data_release.
+ */
+PHP_APCU_API apc_cache_entry_data_t *apc_cache_entry_data_incref(
+		apc_cache_t *cache, apc_cache_entry_t *entry);
+PHP_APCU_API void apc_cache_data_release(apc_cache_t *cache, apc_cache_entry_data_t *data);
 
 /*
  * apc_cache_entry_release decrements the reference count associated with a cache
@@ -333,9 +362,13 @@ static inline void apc_cache_runlock(apc_cache_t *cache) {
 
 /* ENTRYAT and ENTRYOF are used to convert between offsets and pointers to cache entries.
  * Both expect the presence of cache->header that points to the cache header in the
- * shared memory segment. */
+ * shared memory segment. DATAAT/DATAOF are the same for entry data blocks;
+ * ENTRY_DATA resolves an entry's current data block. */
 #define ENTRYAT(offset) ((apc_cache_entry_t *)((uintptr_t)cache->header + (uintptr_t)offset))
 #define ENTRYOF(entry) (((uintptr_t)entry) - (uintptr_t)cache->header)
+#define DATAAT(offset) ((apc_cache_entry_data_t *)((uintptr_t)cache->header + (uintptr_t)offset))
+#define DATAOF(data) (((uintptr_t)data) - (uintptr_t)cache->header)
+#define ENTRY_DATA(entry) DATAAT((entry)->data)
 
 #endif
 

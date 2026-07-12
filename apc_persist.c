@@ -262,8 +262,8 @@ static zend_bool apc_persist_calc_zval(apc_persist_context_t *ctxt, const zval *
 	}
 }
 
-static zend_bool apc_persist_calc(apc_persist_context_t *ctxt, const zend_string *key, const zval *zv) {
-	ADD_SIZE(APC_ENTRY_SIZE(ZSTR_LEN(key)));
+static zend_bool apc_persist_calc(apc_persist_context_t *ctxt, const zval *zv) {
+	ADD_SIZE(sizeof(apc_cache_entry_data_t));
 
 	if (ctxt->ei) {
 		ADD_SIZE_STR(ZSTR_LEN(ctxt->ei));
@@ -472,47 +472,42 @@ static void apc_persist_copy_zval_impl(apc_persist_context_t *ctxt, zval *zv) {
 	}
 }
 
-static apc_cache_entry_t *apc_persist_create_entry(
-		apc_persist_context_t *ctxt, zend_string *key, const zval *zv)
+static apc_cache_entry_data_t *apc_persist_create_data(
+		apc_persist_context_t *ctxt, const zval *zv)
 {
-	/* Get memory for the entry (incl. key) */
-	apc_cache_entry_t *entry = ALLOC(APC_ENTRY_SIZE(ZSTR_LEN(key)));
+	apc_cache_entry_data_t *data = ALLOC(sizeof(apc_cache_entry_data_t));
 
-	/* Deep copy of the key */
-	GC_SET_REFCOUNT(&entry->key, 1);
-	GC_SET_PERSISTENT_TYPE(&entry->key, IS_STRING);
-	ZSTR_LEN(&entry->key) = ZSTR_LEN(key);
-	memcpy(ZSTR_VAL(&entry->key), ZSTR_VAL(key), ZSTR_LEN(key));
-	ZSTR_VAL(&entry->key)[ZSTR_LEN(key)] = '\0';
-	ZSTR_H(&entry->key) = zend_string_hash_val(key);
+	data->owner = 0;
+	data->gc_next = 0;
+	data->dtime = 0;
 
 	/* Deep copy of the value */
-	ZVAL_COPY_VALUE(&entry->val, zv);
-	apc_persist_copy_zval(ctxt, &entry->val);
+	ZVAL_COPY_VALUE(&data->val, zv);
+	apc_persist_copy_zval(ctxt, &data->val);
 
 	/* Deep copy of the expiration identifier, if any */
 	if (ctxt->ei) {
 		zend_string *ei = apc_persist_copy_zstr_no_add(ctxt, ctxt->ei);
-		entry->ei = (uintptr_t) TO_OFF(ei);
+		data->ei = (uintptr_t) TO_OFF(ei);
 	} else {
-		entry->ei = 0;
+		data->ei = 0;
 	}
 
-	return entry;
+	return data;
 }
 
-static void apc_persist_sma_init_entry(apc_cache_entry_t *entry) {
-	/* The ref_count must be initialized during allocation. This ensures that the entry
+static void apc_persist_sma_init_data(void *pointer) {
+	/* The ref_count must be initialized during allocation. This ensures that the block
 	 * is not moved by defragmentation before all persistence operations are completed
-	 * and the entry is stored in the hash table. */
-	entry->ref_count = 1;
+	 * and the block is attached to an entry. */
+	((apc_cache_entry_data_t *) pointer)->ref_count = 1;
 }
 
-apc_cache_entry_t *apc_persist_ex(
-		apc_sma_t *sma, apc_serializer_t *serializer, zend_string *key, const zval *val,
+apc_cache_entry_data_t *apc_persist_data_ex(
+		apc_sma_t *sma, apc_serializer_t *serializer, const zval *val,
 		unsigned char *serialized_str, size_t serialized_str_len, zend_string *ei) {
 	apc_persist_context_t ctxt;
-	apc_cache_entry_t *entry;
+	apc_cache_entry_data_t *data;
 
 	apc_persist_init_context(&ctxt, serializer);
 	ctxt.ei = ei;
@@ -545,7 +540,7 @@ apc_cache_entry_t *apc_persist_ex(
 		ctxt.serialized_str_len = serialized_str_len;
 	}
 
-	if (!apc_persist_calc(&ctxt, key, val)) {
+	if (!apc_persist_calc(&ctxt, val)) {
 		if (!ctxt.use_serialization) {
 			apc_persist_destroy_context(&ctxt);
 			return NULL;
@@ -554,43 +549,78 @@ apc_cache_entry_t *apc_persist_ex(
 		/* Try again with serialization */
 		apc_persist_destroy_context(&ctxt);
 		apc_persist_init_context(&ctxt, serializer);
+		ctxt.ei = ei;
 		ctxt.use_serialization = 1;
-		if (!apc_persist_calc(&ctxt, key, val)) {
+		if (!apc_persist_calc(&ctxt, val)) {
 			apc_persist_destroy_context(&ctxt);
 			return NULL;
 		}
 	}
 
-	ctxt.alloc = ctxt.alloc_cur = apc_sma_malloc(sma, ctxt.size, (apc_sma_malloc_init_f)apc_persist_sma_init_entry);
+	ctxt.alloc = ctxt.alloc_cur = apc_sma_malloc_ex(
+		sma, ctxt.size, APC_SMA_BLOCK_TYPE_B, apc_persist_sma_init_data);
 	if (!ctxt.alloc) {
 		apc_persist_destroy_context(&ctxt);
 		return NULL;
 	}
 
-	entry = apc_persist_create_entry(&ctxt, key, val);
+	data = apc_persist_create_data(&ctxt, val);
 	ZEND_ASSERT(ctxt.alloc_cur == ctxt.alloc + ctxt.size);
 
-	entry->mem_size = ctxt.size;
+	data->mem_size = ctxt.size;
 
 	apc_persist_destroy_context(&ctxt);
+	return data;
+}
+
+/* Allocate and initialize an entry block (the per-key part: links, stats and
+ * the key string; the value lives in its own data block). The creation
+ * reference is set under the SMA lock so defragmentation cannot move the
+ * block before it is linked into the cache. */
+static void apc_persist_sma_init_entry(void *pointer) {
+	((apc_cache_entry_t *) pointer)->ref_count = 1;
+}
+
+apc_cache_entry_t *apc_persist_alloc_entry(apc_sma_t *sma, zend_string *key) {
+	apc_cache_entry_t *entry = apc_sma_malloc_ex(
+		sma, APC_ENTRY_SIZE(ZSTR_LEN(key)), APC_SMA_BLOCK_TYPE_A, apc_persist_sma_init_entry);
+
+	if (!entry) {
+		return NULL;
+	}
+
+	entry->next = 0;
+	entry->prev = 0;
+	entry->ttl = 0;
+	entry->nhits = 0;
+	entry->ctime = 0;
+	entry->mtime = 0;
+	entry->dtime = 0;
+	entry->atime = 0;
+	entry->mem_size = APC_ENTRY_SIZE(ZSTR_LEN(key));
+	entry->data = 0;
+
+	/* Deep copy of the key */
+	GC_SET_REFCOUNT(&entry->key, 1);
+	GC_SET_PERSISTENT_TYPE(&entry->key, IS_STRING);
+	ZSTR_LEN(&entry->key) = ZSTR_LEN(key);
+	memcpy(ZSTR_VAL(&entry->key), ZSTR_VAL(key), ZSTR_LEN(key));
+	ZSTR_VAL(&entry->key)[ZSTR_LEN(key)] = '\0';
+	ZSTR_H(&entry->key) = zend_string_hash_val(key);
+
 	return entry;
 }
 
-apc_cache_entry_t *apc_persist(
-		apc_sma_t *sma, apc_serializer_t *serializer, zend_string *key, const zval *val) {
-	return apc_persist_ex(sma, serializer, key, val, NULL, 0, NULL);
-}
-
 /*
- * COMPARE: Check whether a stored entry's value is identical to a candidate,
+ * COMPARE: Check whether a stored value is identical to a candidate,
  * so that rewriting identical data can be skipped (apcu_update, GH #355).
  * All helpers are best-effort: false negatives merely cause an ordinary store.
- * Entries store pointers as entry-relative offsets, so payload strings are
- * resolved against the entry's own address.
+ * Data blocks store pointers as block-relative offsets, so payload strings are
+ * resolved against the block's own address.
  */
 
-static zend_always_inline const zend_string *apc_entry_str_at(const apc_cache_entry_t *entry) {
-	return (const zend_string *)((const char *)entry + (uintptr_t)Z_PTR(entry->val));
+static zend_always_inline const zend_string *apc_data_str_at(const apc_cache_entry_data_t *data) {
+	return (const zend_string *)((const char *)data + (uintptr_t)Z_PTR(data->val));
 }
 
 static zend_always_inline zend_bool apc_entry_str_identical(
@@ -600,16 +630,16 @@ static zend_always_inline zend_bool apc_entry_str_identical(
 
 /* Compare a stored entry against a request-local value. When serialized_str is
  * non-NULL it is the serialized form of val and takes precedence. */
-zend_bool apc_entry_value_identical(
-		const apc_cache_entry_t *entry, const zval *val,
+zend_bool apc_data_value_identical(
+		const apc_cache_entry_data_t *data, const zval *val,
 		const unsigned char *serialized_str, size_t serialized_str_len) {
 	if (serialized_str) {
-		return Z_TYPE(entry->val) == IS_PTR
+		return Z_TYPE(data->val) == IS_PTR
 			&& apc_entry_str_identical(
-				apc_entry_str_at(entry), (const char *) serialized_str, serialized_str_len);
+				apc_data_str_at(data), (const char *) serialized_str, serialized_str_len);
 	}
 
-	if (Z_TYPE(entry->val) != Z_TYPE_P(val)) {
+	if (Z_TYPE(data->val) != Z_TYPE_P(val)) {
 		return 0;
 	}
 
@@ -619,13 +649,13 @@ zend_bool apc_entry_value_identical(
 		case IS_TRUE:
 			return 1;
 		case IS_LONG:
-			return Z_LVAL(entry->val) == Z_LVAL_P(val);
+			return Z_LVAL(data->val) == Z_LVAL_P(val);
 		case IS_DOUBLE:
 			/* Bitwise: a skip must guarantee the stored bytes would not change */
-			return memcmp(&Z_DVAL(entry->val), &Z_DVAL_P(val), sizeof(double)) == 0;
+			return memcmp(&Z_DVAL(data->val), &Z_DVAL_P(val), sizeof(double)) == 0;
 		case IS_STRING:
 			return apc_entry_str_identical(
-				apc_entry_str_at(entry), Z_STRVAL_P(val), Z_STRLEN_P(val));
+				apc_data_str_at(data), Z_STRVAL_P(val), Z_STRLEN_P(val));
 		default:
 			return 0;
 	}
@@ -633,34 +663,34 @@ zend_bool apc_entry_value_identical(
 
 /* Compare a stored entry's expiration identifier against a request-local one.
  * Entries stored without an identifier never match. */
-zend_bool apc_entry_ei_matches(const apc_cache_entry_t *entry, const zend_string *ei) {
+zend_bool apc_data_ei_matches(const apc_cache_entry_data_t *data, const zend_string *ei) {
 	const zend_string *stored;
 
-	if (!entry->ei) {
+	if (!data->ei) {
 		return 0;
 	}
 
-	stored = (const zend_string *)((const char *) entry + entry->ei);
+	stored = (const zend_string *)((const char *) data + data->ei);
 	return apc_entry_str_identical(stored, ZSTR_VAL(ei), ZSTR_LEN(ei));
 }
 
 /* Fetch a request-local copy of an entry's expiration identifier, or NULL. */
-zend_string *apc_entry_fetch_ei(const apc_cache_entry_t *entry) {
+zend_string *apc_data_fetch_ei(const apc_cache_entry_data_t *data) {
 	const zend_string *stored;
 
-	if (!entry->ei) {
+	if (!data->ei) {
 		return NULL;
 	}
 
-	stored = (const zend_string *)((const char *) entry + entry->ei);
+	stored = (const zend_string *)((const char *) data + data->ei);
 	return zend_string_init(ZSTR_VAL(stored), ZSTR_LEN(stored), 0);
 }
 
 /* Compare the value payloads of two persisted entries. Structurally persisted
  * arrays are never reported identical: their blocks contain uninitialized
  * alignment padding, so their bytes are not comparable. */
-zend_bool apc_entry_payloads_identical(
-		const apc_cache_entry_t *a, const apc_cache_entry_t *b) {
+zend_bool apc_data_payloads_identical(
+		const apc_cache_entry_data_t *a, const apc_cache_entry_data_t *b) {
 	if (Z_TYPE(a->val) != Z_TYPE(b->val)) {
 		return 0;
 	}
@@ -676,8 +706,8 @@ zend_bool apc_entry_payloads_identical(
 			return memcmp(&Z_DVAL(a->val), &Z_DVAL(b->val), sizeof(double)) == 0;
 		case IS_STRING:
 		case IS_PTR: {
-			const zend_string *sb = apc_entry_str_at(b);
-			return apc_entry_str_identical(apc_entry_str_at(a), ZSTR_VAL(sb), ZSTR_LEN(sb));
+			const zend_string *sb = apc_data_str_at(b);
+			return apc_entry_str_identical(apc_data_str_at(a), ZSTR_VAL(sb), ZSTR_LEN(sb));
 		}
 		default:
 			return 0;
@@ -705,8 +735,8 @@ typedef struct _apc_unpersist_context_t {
 static void apc_unpersist_zval_impl(apc_unpersist_context_t *ctxt, zval *zv);
 
 static inline void *apc_unpersist_compute_pointer(void *off, apc_unpersist_context_t *ctxt) {
-	/* The offset must be smaller than the size of the entry (in shm) to be unpersisted */
-	assert((uintptr_t)off < (uintptr_t)((apc_cache_entry_t *)ctxt->alloc)->mem_size);
+	/* The offset must be smaller than the size of the data block (in shm) to be unpersisted */
+	assert((uintptr_t)off < (uintptr_t)((apc_cache_entry_data_t *)ctxt->alloc)->mem_size);
 
 	return (void *)((uintptr_t)ctxt->alloc + (uintptr_t)off);
 }
@@ -876,24 +906,24 @@ static void apc_unpersist_zval_impl(apc_unpersist_context_t *ctxt, zval *zv) {
 	}
 }
 
-zend_bool apc_unpersist(zval *dst, const apc_cache_entry_t *entry, apc_serializer_t *serializer) {
+zend_bool apc_unpersist(zval *dst, const apc_cache_entry_data_t *data, apc_serializer_t *serializer) {
 	apc_unpersist_context_t ctxt;
 
 	/* Needed to convert offsets back to pointers */
-	ctxt.alloc = (char *)entry;
+	ctxt.alloc = (char *)data;
 
-	if (Z_TYPE(entry->val) == IS_PTR) {
-		return apc_unpersist_serialized(&ctxt, dst, Z_PTR(entry->val), serializer);
+	if (Z_TYPE(data->val) == IS_PTR) {
+		return apc_unpersist_serialized(&ctxt, dst, Z_PTR(data->val), serializer);
 	}
 
 	ctxt.memoization_needed = 0;
-	ZEND_ASSERT(Z_TYPE(entry->val) != IS_REFERENCE);
-	if (Z_TYPE(entry->val) == IS_ARRAY) {
+	ZEND_ASSERT(Z_TYPE(data->val) != IS_REFERENCE);
+	if (Z_TYPE(data->val) == IS_ARRAY) {
 		ctxt.memoization_needed = 1;
 		zend_hash_init(&ctxt.already_copied, 0, NULL, NULL, 0);
 	}
 
-	ZVAL_COPY_VALUE(dst, &entry->val);
+	ZVAL_COPY_VALUE(dst, &data->val);
 	apc_unpersist_zval(&ctxt, dst);
 
 	if (ctxt.memoization_needed) {
