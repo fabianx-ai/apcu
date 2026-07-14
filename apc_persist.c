@@ -558,7 +558,7 @@ apc_cache_entry_data_t *apc_persist_data_ex(
 	}
 
 	ctxt.alloc = ctxt.alloc_cur = apc_sma_malloc_ex(
-		sma, ctxt.size, APC_SMA_BLOCK_TYPE_B, apc_persist_sma_init_data);
+		sma, ctxt.size, APC_SMA_BLOCK_DATA, apc_persist_sma_init_data);
 	if (!ctxt.alloc) {
 		apc_persist_destroy_context(&ctxt);
 		return NULL;
@@ -581,14 +581,13 @@ static void apc_persist_sma_init_entry(void *pointer) {
 	((apc_cache_entry_t *) pointer)->ref_count = 1;
 }
 
-apc_cache_entry_t *apc_persist_alloc_entry(apc_sma_t *sma, zend_string *key) {
-	apc_cache_entry_t *entry = apc_sma_malloc_ex(
-		sma, APC_ENTRY_SIZE(ZSTR_LEN(key)), APC_SMA_BLOCK_TYPE_A, apc_persist_sma_init_entry);
-
-	if (!entry) {
-		return NULL;
-	}
-
+/* Initialize an entry block in place: reset all fields and deep-copy the key.
+ * Used both for directly allocated blocks and for slots from the entry pool
+ * (which are reused and must be fully reset). The creation reference is NOT
+ * set here — direct allocations set it under the SMA lock, pool slots are
+ * only ever handled under the cache write lock. */
+void apc_persist_init_entry(
+		apc_cache_entry_t *entry, zend_string *key, zend_long mem_size, zend_uchar pooled) {
 	entry->next = 0;
 	entry->prev = 0;
 	entry->ttl = 0;
@@ -597,7 +596,8 @@ apc_cache_entry_t *apc_persist_alloc_entry(apc_sma_t *sma, zend_string *key) {
 	entry->mtime = 0;
 	entry->dtime = 0;
 	entry->atime = 0;
-	entry->mem_size = APC_ENTRY_SIZE(ZSTR_LEN(key));
+	entry->mem_size = mem_size;
+	entry->pooled = pooled;
 	entry->data = 0;
 
 	/* Deep copy of the key */
@@ -607,7 +607,17 @@ apc_cache_entry_t *apc_persist_alloc_entry(apc_sma_t *sma, zend_string *key) {
 	memcpy(ZSTR_VAL(&entry->key), ZSTR_VAL(key), ZSTR_LEN(key));
 	ZSTR_VAL(&entry->key)[ZSTR_LEN(key)] = '\0';
 	ZSTR_H(&entry->key) = zend_string_hash_val(key);
+}
 
+apc_cache_entry_t *apc_persist_alloc_entry(apc_sma_t *sma, zend_string *key) {
+	apc_cache_entry_t *entry = apc_sma_malloc_ex(
+		sma, APC_ENTRY_SIZE(ZSTR_LEN(key)), APC_SMA_BLOCK_ENTRY, apc_persist_sma_init_entry);
+
+	if (!entry) {
+		return NULL;
+	}
+
+	apc_persist_init_entry(entry, key, APC_ENTRY_SIZE(ZSTR_LEN(key)), 0);
 	return entry;
 }
 

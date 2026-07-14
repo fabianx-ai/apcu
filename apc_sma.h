@@ -88,12 +88,17 @@ PHP_APCU_API void* apc_sma_malloc(apc_sma_t* sma, size_t size, apc_sma_malloc_in
 
 /*
 * apc_sma_malloc_ex additionally tags the allocated block with a caller-defined
-* type bit that is reported back through the move() callback during
+* type (3 bits) that is reported back through the move() callback during
 * defragmentation, so heterogeneous block types can be relocated correctly.
 */
-#define APC_SMA_BLOCK_TYPE_A 0
-#define APC_SMA_BLOCK_TYPE_B 1
-PHP_APCU_API void* apc_sma_malloc_ex(apc_sma_t* sma, size_t size, zend_bool type_b, apc_sma_malloc_init_f init_callback);
+#define APC_SMA_BLOCK_TYPE_MASK ((size_t) 7)
+PHP_APCU_API void* apc_sma_malloc_ex(apc_sma_t* sma, size_t size, size_t block_type, apc_sma_malloc_init_f init_callback);
+
+/*
+* apc_sma_try_malloc_ex is apc_sma_malloc_ex without the expunge-and-retry:
+* opportunistic allocations (e.g. pool growth) must not wipe the cache.
+*/
+PHP_APCU_API void* apc_sma_try_malloc_ex(apc_sma_t* sma, size_t size, size_t block_type, apc_sma_malloc_init_f init_callback);
 
 /*
 * apc_sma_api_free will free p (which should be a pointer to a block allocated from sma)
@@ -132,11 +137,11 @@ PHP_APCU_API zend_bool apc_sma_check_avail_contiguous(apc_sma_t *sma, size_t siz
 * The move() callback is called for each allocated block before it is moved. Therefore, move() can be used
 * to prepare for the move or to prevent the block from being moved by returning 0. The argument "data" is
 * passed as the first argument from apc_sma_defrag() to move(), while the old and the new address of the
-* allocation is passed as the 2nd and 3rd argument. The 4th argument is the block-type bit the allocation
+* allocation is passed as the 2nd and 3rd argument. The 4th argument is the block type the allocation
 * was tagged with by apc_sma_malloc_ex. The callback must not write to the new memory area
 * because the area is not yet allocated during the callback.
 */
-typedef zend_bool (*apc_sma_move_f)(void *data, void *pointer_old, void *pointer_new, zend_bool type_b);
+typedef zend_bool (*apc_sma_move_f)(void *data, void *pointer_old, void *pointer_new, size_t block_type);
 PHP_APCU_API void apc_sma_defrag(apc_sma_t *sma, void *data, apc_sma_move_f move);
 
 /* ALIGNWORD: pad up x, aligned to the system's word boundary */

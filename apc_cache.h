@@ -76,6 +76,7 @@ struct apc_cache_entry_t {
 	time_t dtime;            /* time entry was removed from cache */
 	time_t atime;            /* time entry was last accessed */
 	zend_long mem_size;      /* memory used by this block (the value is accounted separately) */
+	zend_uchar pooled;       /* 0: directly allocated; 1: live pool slot; 2: free pool slot */
 	uintptr_t data;          /* offset (from cache header) of the entry's apc_cache_entry_data_t */
 	zend_string key;         /* entry key (MUST BE THE LAST FIELD OF THE STRUCT!) */
 };
@@ -96,6 +97,8 @@ typedef struct _apc_cache_header_t {
 	apc_cache_slam_key_t lastkey;   /* last key inserted (not necessarily without error) */
 	uintptr_t gc;                   /* offset in shm to the first entry of gc list */
 	uintptr_t gc_data;              /* offset in shm to the first detached data block of the data gc list */
+	uintptr_t entry_pool;           /* offset in shm to the first free slot of the entry pool */
+	uintptr_t pool_batches;         /* offset in shm to the first entry-pool batch block */
 } apc_cache_header_t;
 
 typedef struct _apc_cache_t {
@@ -359,6 +362,34 @@ static inline void apc_cache_runlock(apc_cache_t *cache) {
 
 /* APC_ENTRY_SIZE takes into account the trailing key-string + terminating 0-byte */
 #define APC_ENTRY_SIZE(key_len) (ZEND_MM_ALIGNED_SIZE(offsetof(apc_cache_entry_t, key.val) + key_len + 1))
+
+/* Entry blocks for keys up to this length come from a pool of fixed-size
+ * slots, batch-allocated so that inserting a fresh key costs no SMA
+ * allocation of its own (GH #346: "entry_t is allocated via a pool").
+ * Longer keys fall back to a direct allocation. */
+#define APC_POOL_KEY_MAX 152
+#define APC_POOL_SLOT_SIZE APC_ENTRY_SIZE(APC_POOL_KEY_MAX)
+#define APC_POOL_BATCH 64
+
+/* Slot states in apc_cache_entry_t.pooled */
+#define APC_ENTRY_DIRECT    0
+#define APC_ENTRY_POOL_LIVE 1
+#define APC_ENTRY_POOL_FREE 2
+
+/* Pool slots come in batch blocks, registered in a list so that they can be
+ * reclaimed by a real expunge. Each batch starts with this header. */
+typedef struct apc_pool_batch_t {
+	uintptr_t next;          /* offset (from cache header) of the next batch */
+} apc_pool_batch_t;
+#define APC_POOL_BATCH_HDR ZEND_MM_ALIGNED_SIZE(sizeof(apc_pool_batch_t))
+#define APC_POOL_BATCH_BYTES (APC_POOL_BATCH_HDR + (size_t) APC_POOL_BATCH * APC_POOL_SLOT_SIZE)
+#define APC_POOL_BATCH_SLOT(batch, i) \
+	((apc_cache_entry_t *)((char *)(batch) + APC_POOL_BATCH_HDR + (size_t)(i) * APC_POOL_SLOT_SIZE))
+
+/* SMA block types used by the cache (3 tag bits available) */
+#define APC_SMA_BLOCK_ENTRY 0  /* a directly allocated [entry|key] block */
+#define APC_SMA_BLOCK_DATA  1  /* an apc_cache_entry_data_t value block */
+#define APC_SMA_BLOCK_POOL  2  /* a batch of entry-pool slots; immovable */
 
 /* ENTRYAT and ENTRYOF are used to convert between offsets and pointers to cache entries.
  * Both expect the presence of cache->header that points to the cache header in the

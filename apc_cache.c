@@ -71,6 +71,8 @@ zend_bool apc_data_ei_matches(const apc_cache_entry_data_t *data, const zend_str
 zend_string *apc_data_fetch_ei(const apc_cache_entry_data_t *data);
 zend_bool apc_unpersist(zval *dst, const apc_cache_entry_data_t *data, apc_serializer_t *serializer);
 apc_cache_entry_t *apc_persist_alloc_entry(apc_sma_t *sma, zend_string *key);
+void apc_persist_init_entry(
+		apc_cache_entry_t *entry, zend_string *key, zend_long mem_size, zend_uchar pooled);
 
 /* make_prime */
 static int const primes[] = {
@@ -133,8 +135,52 @@ static int make_prime(int n)
 	return *(k-1);
 }
 
+/* Entry-pool primitives. The pool is a list of fixed-size entry slots in shm,
+ * linked through entry->next and only ever touched under the write lock, so a
+ * fresh insert of a normal-length key costs no SMA allocation at all
+ * (GH #346: "entry_t is allocated via a pool"). Batch blocks are never freed;
+ * the pool is bounded by the peak number of live entries. */
+static apc_cache_entry_t *apc_cache_wlocked_pool_pop(apc_cache_t *cache, zend_string *key) {
+	apc_cache_entry_t *slot;
+
+	if (!cache->header->entry_pool) {
+		return NULL;
+	}
+
+	slot = ENTRYAT(cache->header->entry_pool);
+	cache->header->entry_pool = slot->next;
+
+	apc_persist_init_entry(slot, key, APC_POOL_SLOT_SIZE, APC_ENTRY_POOL_LIVE);
+	/* creation reference, dropped once the entry is linked */
+	slot->ref_count = 1;
+	return slot;
+}
+
+static void apc_cache_wlocked_pool_push(apc_cache_t *cache, apc_cache_entry_t *slot) {
+	slot->pooled = APC_ENTRY_POOL_FREE;
+	slot->next = cache->header->entry_pool;
+	cache->header->entry_pool = ENTRYOF(slot);
+}
+
+/* Register a batch block and carve it into pool slots. Write lock required. */
+static void apc_cache_wlocked_pool_fill(apc_cache_t *cache, apc_pool_batch_t *batch) {
+	int i;
+
+	batch->next = cache->header->pool_batches;
+	cache->header->pool_batches = ((uintptr_t) batch) - (uintptr_t) cache->header;
+
+	for (i = 0; i < APC_POOL_BATCH; i++) {
+		apc_cache_wlocked_pool_push(cache, APC_POOL_BATCH_SLOT(batch, i));
+	}
+}
+
 static inline void free_entry(apc_cache_t *cache, apc_cache_entry_t *entry) {
-	apc_sma_free(cache->sma, entry);
+	if (entry->pooled == APC_ENTRY_POOL_LIVE) {
+		/* pool slots are recycled, not freed; all callers hold the write lock */
+		apc_cache_wlocked_pool_push(cache, entry);
+	} else {
+		apc_sma_free(cache->sma, entry);
+	}
 }
 
 static inline void free_data(apc_cache_t *cache, apc_cache_entry_data_t *data) {
@@ -193,9 +239,76 @@ static zend_bool apc_cache_entry_expired(
 }
 
 /* apc_cache_wlocked_move_block() is called during defragmentation, before a
- * block (an entry or an entry's data block) is moved to a new position. */
-static zend_bool apc_cache_wlocked_move_block(apc_cache_t *cache, void *old, void *new, zend_bool is_data) {
-	if (is_data) {
+ * block (an entry, an entry's data block, or a pool batch) is moved. */
+static zend_bool apc_cache_wlocked_move_block(apc_cache_t *cache, void *old, void *new, size_t block_type) {
+	if (block_type == APC_SMA_BLOCK_POOL) {
+		/* A batch of entry-pool slots. Relocatable: live slots have their
+		 * neighbor links, gc links and data back references fixed up exactly
+		 * like directly allocated entries, and every pool free-list or batch
+		 * registry pointer into the moved range is rebased. The memory itself
+		 * is moved by the defragmenter after this returns, so all reads go
+		 * through the old addresses. */
+		apc_pool_batch_t *batch = old;
+		ptrdiff_t delta = (char *) new - (char *) old;
+		uintptr_t old_base = ((uintptr_t) old) - (uintptr_t) cache->header;
+		uintptr_t old_end = old_base + APC_POOL_BATCH_BYTES;
+		uintptr_t *link;
+		int i;
+
+		/* refuse when any live slot is referenced (a reader may hold it) */
+		for (i = 0; i < APC_POOL_BATCH; i++) {
+			apc_cache_entry_t *slot = APC_POOL_BATCH_SLOT(batch, i);
+			if (slot->pooled == APC_ENTRY_POOL_LIVE && slot->ref_count > 0) {
+				return 0;
+			}
+		}
+
+		/* rebase the links of live slots (slot lists and the gc list share
+		 * the same structure; a neighbor inside this batch is written through
+		 * its old address and moved afterwards, which yields the same bytes) */
+		for (i = 0; i < APC_POOL_BATCH; i++) {
+			apc_cache_entry_t *slot = APC_POOL_BATCH_SLOT(batch, i);
+			uintptr_t newoff;
+
+			if (slot->pooled != APC_ENTRY_POOL_LIVE) {
+				continue;
+			}
+
+			newoff = ENTRYOF(slot) + delta;
+			ENTRYAT(slot->prev)->next = newoff;
+			if (slot->next) {
+				ENTRYAT(slot->next)->prev = newoff;
+			}
+			if (slot->data) {
+				ENTRY_DATA(slot)->owner = newoff;
+			}
+		}
+
+		/* rebase pool free-list pointers into the moved range; chase the
+		 * chain through the old addresses */
+		link = &cache->header->entry_pool;
+		while (*link) {
+			uintptr_t cur = *link;
+			if (cur >= old_base && cur < old_end) {
+				*link = cur + delta;
+			}
+			link = &ENTRYAT(cur)->next;
+		}
+
+		/* rebase batch registry pointers the same way */
+		link = &cache->header->pool_batches;
+		while (*link) {
+			uintptr_t cur = *link;
+			if (cur >= old_base && cur < old_end) {
+				*link = cur + delta;
+			}
+			link = &((apc_pool_batch_t *) ((uintptr_t) cache->header + cur))->next;
+		}
+
+		return 1;
+	}
+
+	if (block_type == APC_SMA_BLOCK_DATA) {
 		apc_cache_entry_data_t *data = old;
 
 		/* Readers hold raw pointers into referenced blocks, and detached
@@ -426,6 +539,8 @@ PHP_APCU_API apc_cache_t* apc_cache_create(apc_sma_t* sma, apc_serializer_t* ser
 	cache->header->nexpunges = 0;
 	cache->header->gc = 0;
 	cache->header->gc_data = 0;
+	cache->header->entry_pool = 0;
+	cache->header->pool_batches = 0;
 	cache->header->stime = time(NULL);
 
 	/* set cache options */
@@ -564,10 +679,29 @@ static inline zend_bool apc_cache_wlocked_store_internal(
 		return 1;
 	}
 
-	entry = apc_persist_alloc_entry(cache->sma, key);
+	if (ZSTR_LEN(key) <= APC_POOL_KEY_MAX) {
+		entry = apc_cache_wlocked_pool_pop(cache, key);
+		if (!entry) {
+			/* Refill under the held lock: this runs inside apcu_entry, where
+			 * a nested expunge uses the entry-level no-op locks (the same
+			 * pre-existing caveat as the value allocation above). */
+			apc_pool_batch_t *batch = apc_sma_try_malloc_ex(
+				cache->sma, APC_POOL_BATCH_BYTES, APC_SMA_BLOCK_POOL, NULL);
+			if (batch) {
+				apc_cache_wlocked_pool_fill(cache, batch);
+				entry = apc_cache_wlocked_pool_pop(cache, key);
+			}
+		}
+	} else {
+		entry = NULL;
+	}
+
 	if (!entry) {
-		free_data(cache, data);
-		return 0;
+		entry = apc_persist_alloc_entry(cache->sma, key);
+		if (!entry) {
+			free_data(cache, data);
+			return 0;
+		}
 	}
 
 	/* The allocations above may have expunged the cache; re-walk the slot to
@@ -671,6 +805,7 @@ static zend_bool apc_cache_store_ex(
 	zend_bool done = 0;
 	apc_cache_entry_t *new_entry = NULL;
 	apc_cache_entry_data_t *data;
+	char *pending_batch = NULL;
 
 	/* run cache defense */
 	if (apc_cache_defense(cache, key, t)) {
@@ -687,23 +822,6 @@ static zend_bool apc_cache_store_ex(
 		return 0;
 	}
 
-	/* Peek at existence under the read lock to decide whether an entry block
-	 * is needed, so that both the fresh-insert and the in-place-update path
-	 * take the write lock exactly once. A lost race is handled below by
-	 * retrying with (or discarding) the separately allocated block. */
-	if (apc_cache_rlock(cache)) {
-		zend_bool absent = apc_cache_rlocked_find_nostat(cache, key, t) == NULL;
-		apc_cache_runlock(cache);
-
-		if (absent) {
-			new_entry = apc_persist_alloc_entry(cache->sma, key);
-			if (!new_entry) {
-				free_data(cache, data);
-				return 0;
-			}
-		}
-	}
-
 	while (!done) {
 		done = 1;
 
@@ -714,6 +832,12 @@ static zend_bool apc_cache_store_ex(
 		php_apc_try {
 			uintptr_t *tail;
 			apc_cache_entry_t *entry;
+
+			/* hand a batch allocated on the previous iteration to the pool */
+			if (pending_batch) {
+				apc_cache_wlocked_pool_fill(cache, (apc_pool_batch_t *) pending_batch);
+				pending_batch = NULL;
+			}
 
 			/* process deleted lists */
 			apc_cache_wlocked_gc(cache);
@@ -741,24 +865,43 @@ static zend_bool apc_cache_store_ex(
 					apc_cache_wlocked_attach_data(cache, entry, data, ttl, t);
 					ret = 1;
 				}
-			} else if (new_entry) {
-				apc_cache_wlocked_insert_entry(cache, tail, new_entry, data, ttl, t);
-				new_entry = NULL;
-				ret = 1;
 			} else {
-				/* The entry block must be allocated outside the lock (the
-				 * allocation may trigger an expunge, which takes the write
-				 * lock); retry with it in hand. */
-				done = 0;
+				/* Normal-length keys take their entry block from the pool —
+				 * no SMA traffic while the lock is held (GH #346). */
+				if (!new_entry && ZSTR_LEN(key) <= APC_POOL_KEY_MAX) {
+					new_entry = apc_cache_wlocked_pool_pop(cache, key);
+				}
+
+				if (new_entry) {
+					apc_cache_wlocked_insert_entry(cache, tail, new_entry, data, ttl, t);
+					new_entry = NULL;
+					ret = 1;
+				} else {
+					/* Pool empty or oversized key: allocate outside the lock
+					 * (the allocation may trigger an expunge, which takes the
+					 * write lock) and retry. */
+					done = 0;
+				}
 			}
 		} php_apc_finally {
 			apc_cache_wunlock(cache);
 		} php_apc_end_try();
 
 		if (!done) {
-			new_entry = apc_persist_alloc_entry(cache->sma, key);
-			if (!new_entry) {
-				break;
+			if (ZSTR_LEN(key) <= APC_POOL_KEY_MAX) {
+				/* Opportunistic: growing the pool must never expunge the
+				 * cache; when memory is tight, the entry is allocated
+				 * directly and pays its own (justified) expunge. */
+				pending_batch = apc_sma_try_malloc_ex(
+					cache->sma, APC_POOL_BATCH_BYTES, APC_SMA_BLOCK_POOL, NULL);
+			}
+			if (!pending_batch) {
+				/* oversized key, or batch refused under memory pressure:
+				 * a single directly allocated entry block */
+				new_entry = apc_persist_alloc_entry(cache->sma, key);
+				if (!new_entry) {
+					break;
+				}
 			}
 		}
 	}
@@ -767,8 +910,13 @@ static zend_bool apc_cache_store_ex(
 		/* failed or unused candidate value; it was never attached, so free it */
 		free_data(cache, data);
 	}
+	if (pending_batch) {
+		/* the write lock failed before the batch reached the pool */
+		apc_sma_free(cache->sma, pending_batch);
+	}
 	if (new_entry) {
-		/* lost the existence race; the separately allocated entry block is unused */
+		/* lost the existence race; the directly allocated entry block is unused
+		 * (pool slots never leave the locked section, so this is never pooled) */
 		free_entry(cache, new_entry);
 	}
 
@@ -785,8 +933,6 @@ PHP_APCU_API zend_bool apc_cache_store(
 	return apc_cache_store_ex(cache, key, val, ttl, exclusive, NULL, NULL, 0, NULL);
 }
 
-/* Find the live entry for key and, when its value is identical to the candidate,
- * refresh its metadata as if it had been stored. Must be called under write lock. */
 /* Find the live entry for key and, when its value is identical to the candidate,
  * refresh its metadata as if it had been stored. Must be called under write lock. */
 static zend_bool apc_cache_wlocked_refresh_identical(
@@ -1074,6 +1220,42 @@ static void apc_cache_wlocked_real_expunge(apc_cache_t* cache) {
 		uintptr_t *entry_offset = &cache->slots[i];
 		while (*entry_offset) {
 			apc_cache_wlocked_remove_entry(cache, ENTRYAT(*entry_offset));
+		}
+	}
+
+	/* Reclaim entry-pool batches. Batches still containing live slots (only
+	 * possible for reference-parked entries on the gc list) are kept and
+	 * their free slots re-listed; everything else is returned to the SMA. */
+	{
+		uintptr_t *batch_link = &cache->header->pool_batches;
+
+		cache->header->entry_pool = 0;
+
+		while (*batch_link) {
+			apc_pool_batch_t *batch =
+				(apc_pool_batch_t *) ((uintptr_t) cache->header + *batch_link);
+			zend_bool live = 0;
+			int i;
+
+			for (i = 0; i < APC_POOL_BATCH; i++) {
+				if (APC_POOL_BATCH_SLOT(batch, i)->pooled == APC_ENTRY_POOL_LIVE) {
+					live = 1;
+					break;
+				}
+			}
+
+			if (live) {
+				for (i = 0; i < APC_POOL_BATCH; i++) {
+					apc_cache_entry_t *slot = APC_POOL_BATCH_SLOT(batch, i);
+					if (slot->pooled == APC_ENTRY_POOL_FREE) {
+						apc_cache_wlocked_pool_push(cache, slot);
+					}
+				}
+				batch_link = &batch->next;
+			} else {
+				*batch_link = batch->next;
+				apc_sma_free(cache->sma, batch);
+			}
 		}
 	}
 

@@ -151,7 +151,7 @@ static inline block_t *find_block(sma_header_t *smaheader, size_t realsize) {
 }
 
 /* sma_allocate: tries to allocate at least size bytes of shared memory */
-static APC_HOTSPOT size_t sma_allocate(sma_header_t *smaheader, size_t size, zend_bool type_b)
+static APC_HOTSPOT size_t sma_allocate(sma_header_t *smaheader, size_t size, size_t block_type)
 {
 	block_t* cur;           /* working block in list */
 	size_t realsize;        /* actual size of block needed, including block header */
@@ -191,8 +191,8 @@ static APC_HOTSPOT size_t sma_allocate(sma_header_t *smaheader, size_t size, zen
 	cur->fnext = 0;
 
 	/* store used space to be able to reclaim unused space during defragmentation;
-	 * sizes are ALIGNWORD-aligned, so the low bit carries the block-type tag */
-	cur->fprev = realsize | (type_b ? 1 : 0);
+	 * sizes are ALIGNWORD-aligned, so the low bits carry the block-type tag */
+	cur->fprev = realsize | block_type;
 
 	/* update the segment header */
 	smaheader->avail -= cur->size;
@@ -313,9 +313,9 @@ PHP_APCU_API void apc_sma_detach(apc_sma_t* sma) {
 #endif
 }
 
-PHP_APCU_API void* apc_sma_malloc_ex(apc_sma_t* sma, size_t n, zend_bool type_b, apc_sma_malloc_init_f init_callback) {
+static void* apc_sma_malloc_impl(apc_sma_t* sma, size_t n, size_t block_type, apc_sma_malloc_init_f init_callback, zend_bool allow_expunge) {
 	size_t off;
-	zend_bool nuked = 0;
+	zend_bool nuked = !allow_expunge;
 
 restart:
 	assert(sma->initialized);
@@ -329,7 +329,7 @@ restart:
 		return NULL;
 	}
 
-	off = sma_allocate(SMA_HDR(sma), n, type_b);
+	off = sma_allocate(SMA_HDR(sma), n, block_type);
 
 	if (off != SIZE_MAX) {
 		void *p = (void *)(SMA_ADDR(sma) + off);
@@ -358,8 +358,16 @@ restart:
 	return NULL;
 }
 
+PHP_APCU_API void* apc_sma_malloc_ex(apc_sma_t* sma, size_t n, size_t block_type, apc_sma_malloc_init_f init_callback) {
+	return apc_sma_malloc_impl(sma, n, block_type, init_callback, 1);
+}
+
+PHP_APCU_API void* apc_sma_try_malloc_ex(apc_sma_t* sma, size_t n, size_t block_type, apc_sma_malloc_init_f init_callback) {
+	return apc_sma_malloc_impl(sma, n, block_type, init_callback, 0);
+}
+
 PHP_APCU_API void* apc_sma_malloc(apc_sma_t* sma, size_t n, apc_sma_malloc_init_f init_callback) {
-	return apc_sma_malloc_ex(sma, n, APC_SMA_BLOCK_TYPE_A, init_callback);
+	return apc_sma_malloc_impl(sma, n, 0, init_callback, 1);
 }
 
 PHP_APCU_API void apc_sma_free(apc_sma_t* sma, void* p) {
@@ -507,7 +515,7 @@ PHP_APCU_API void apc_sma_defrag(apc_sma_t *sma, void *data, apc_sma_move_f move
 		block_t *nxt = NEXT_SBLOCK(cur);
 
 		/* if nxt is the last block, or if nxt can't be moved, cur can't be combined with other free blocks */
-		if (nxt->size == 0 || !move(data, (char *)nxt + ALIGNWORD(sizeof(block_t)), (char *)cur + ALIGNWORD(sizeof(block_t)), nxt->fprev & 1)) {
+		if (nxt->size == 0 || !move(data, (char *)nxt + ALIGNWORD(sizeof(block_t)), (char *)cur + ALIGNWORD(sizeof(block_t)), nxt->fprev & APC_SMA_BLOCK_TYPE_MASK)) {
 			/* insert cur into the free list */
 			link_free_block_at_start(smaheader, cur);
 
@@ -519,8 +527,8 @@ PHP_APCU_API void apc_sma_defrag(apc_sma_t *sma, void *data, apc_sma_move_f move
 		}
 
 		/* reclaim unused space from the allocated block (nxt->fprev contains
-		 * the used space, with the block-type tag in the low bit) */
-		size_t free_size = nxt->size - (nxt->fprev & ~(size_t)1);
+		 * the used space, with the block-type tag in the low bits) */
+		size_t free_size = nxt->size - (nxt->fprev & ~APC_SMA_BLOCK_TYPE_MASK);
 		reclaimed_size += free_size;
 		nxt->size -= free_size;
 		free_size += cur->size;
