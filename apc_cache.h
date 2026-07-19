@@ -223,6 +223,14 @@ PHP_APCU_API zend_bool apc_cache_atomic_update_long(
 PHP_APCU_API zend_bool apc_cache_fetch(apc_cache_t* cache, zend_string *key, time_t t, zval *dst);
 
 /*
+ * apc_cache_fetch_ei additionally returns the expiration identifier stored
+ * with the value; the (value, identifier) pair is read atomically from one
+ * pinned data block. *ei receives a new string or NULL.
+ */
+PHP_APCU_API zend_bool apc_cache_fetch_ei(
+		apc_cache_t* cache, zend_string *key, time_t t, zval *dst, zend_string **ei);
+
+/*
  * apc_cache_exists searches for a cache entry by its hashed identifier,
  * and returns whether the entry exists.
  */

@@ -1,5 +1,5 @@
 /* This is a generated file, edit the .stub.php file instead.
- * Stub hash: e407210ad733c1027fa28a215d8e3bb03aa880c3 */
+ * Stub hash: 2e83c6c776bd00595166631960b81dad4764aa16 */
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_apcu_clear_cache, 0, 0, 0)
 ZEND_END_ARG_INFO()
@@ -32,6 +32,8 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_apcu_add_ei, 0, 0, 2)
 	ZEND_ARG_INFO(0, value)
 	ZEND_ARG_INFO(0, ttl)
 ZEND_END_ARG_INFO()
+
+#define arginfo_apcu_fetch_ei arginfo_apcu_key_info
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_apcu_inc, 0, 0, 1)
 	ZEND_ARG_INFO(0, key)
@@ -79,6 +81,7 @@ PHP_APCU_API ZEND_FUNCTION(apcu_store);
 PHP_APCU_API ZEND_FUNCTION(apcu_add);
 PHP_APCU_API ZEND_FUNCTION(apcu_update);
 PHP_APCU_API ZEND_FUNCTION(apcu_add_ei);
+PHP_APCU_API ZEND_FUNCTION(apcu_fetch_ei);
 PHP_APCU_API ZEND_FUNCTION(apcu_inc);
 PHP_APCU_API ZEND_FUNCTION(apcu_dec);
 PHP_APCU_API ZEND_FUNCTION(apcu_cas);
@@ -101,6 +104,7 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(apcu_add, arginfo_apcu_add)
 	ZEND_FE(apcu_update, arginfo_apcu_update)
 	ZEND_FE(apcu_add_ei, arginfo_apcu_add_ei)
+	ZEND_FE(apcu_fetch_ei, arginfo_apcu_fetch_ei)
 	ZEND_FE(apcu_inc, arginfo_apcu_inc)
 	ZEND_FE(apcu_dec, arginfo_apcu_dec)
 	ZEND_FE(apcu_cas, arginfo_apcu_cas)

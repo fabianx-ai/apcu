@@ -1497,6 +1497,49 @@ end_lbl:
 	return 1;
 }
 
+/* Fetch a value together with the expiration identifier it was stored with
+ * (GH #356). The pinned data block holds both, so the returned pair is
+ * atomic by construction — a fetch and a separate apcu_key_info() call
+ * could straddle a concurrent swap (GH #345). *ei is set to a new string
+ * or NULL. */
+PHP_APCU_API zend_bool apc_cache_fetch_ei(
+		apc_cache_t* cache, zend_string *key, time_t t, zval *dst, zend_string **ei)
+{
+	apc_cache_entry_t *entry;
+	apc_cache_entry_data_t *data;
+	zend_bool retval = 0;
+
+	*ei = NULL;
+
+	if (!cache) {
+		return 0;
+	}
+
+	if (!apc_cache_rlock(cache)) {
+		return 0;
+	}
+
+	entry = apc_cache_rlocked_find(cache, key, t);
+	if (!entry) {
+		apc_cache_runlock(cache);
+		return 0;
+	}
+
+	data = apc_cache_entry_data_incref(cache, entry);
+	apc_cache_runlock(cache);
+
+	php_apc_try {
+		retval = apc_cache_data_fetch_zval(cache, data, dst);
+		if (retval) {
+			*ei = apc_data_fetch_ei(data);
+		}
+	} php_apc_finally {
+		apc_cache_data_release(cache, data);
+	} php_apc_end_try();
+
+	return retval;
+}
+
 PHP_APCU_API zend_bool apc_cache_fetch(apc_cache_t* cache, zend_string *key, time_t t, zval *dst)
 {
 	apc_cache_entry_t *entry;

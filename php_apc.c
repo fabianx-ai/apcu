@@ -733,6 +733,77 @@ PHP_FUNCTION(apcu_fetch) {
 	}
 }
 
+/* {{{ proto array|false apcu_fetch_ei(string|array key)
+   Fetch values together with the expiration identifiers they were stored
+   with (see apcu_add_ei). Each hit maps the key to an array with 'value'
+   and 'ei' (string or null); the pair is read atomically. */
+PHP_FUNCTION(apcu_fetch_ei) {
+	zval *key;
+	time_t t;
+
+	ZEND_PARSE_PARAMETERS_START(1, 1)
+		Z_PARAM_ZVAL(key)
+	ZEND_PARSE_PARAMETERS_END();
+
+	if (!APCG(enabled)) {
+		RETURN_FALSE;
+	}
+
+	t = apc_time();
+
+	if (Z_TYPE_P(key) == IS_STRING) {
+		zval value;
+		zend_string *ei = NULL;
+
+		if (!apc_cache_fetch_ei(apc_user_cache, Z_STR_P(key), t, &value, &ei)) {
+			RETURN_FALSE;
+		}
+
+		array_init(return_value);
+		add_assoc_zval(return_value, "value", &value);
+		if (ei) {
+			add_assoc_str(return_value, "ei", ei);
+		} else {
+			add_assoc_null(return_value, "ei");
+		}
+		return;
+	}
+
+	if (Z_TYPE_P(key) == IS_ARRAY) {
+		zval *hentry;
+
+		array_init(return_value);
+		ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(key), hentry) {
+			zval value, pair;
+			zend_string *ei = NULL;
+
+			ZVAL_DEREF(hentry);
+			if (Z_TYPE_P(hentry) != IS_STRING) {
+				apc_warning("apcu_fetch_ei() expects a string or an array of strings.");
+				continue;
+			}
+
+			if (!apc_cache_fetch_ei(apc_user_cache, Z_STR_P(hentry), t, &value, &ei)) {
+				continue;
+			}
+
+			array_init(&pair);
+			add_assoc_zval(&pair, "value", &value);
+			if (ei) {
+				add_assoc_str(&pair, "ei", ei);
+			} else {
+				add_assoc_null(&pair, "ei");
+			}
+			zend_symtable_add_new(Z_ARRVAL_P(return_value), Z_STR_P(hentry), &pair);
+		} ZEND_HASH_FOREACH_END();
+		return;
+	}
+
+	apc_warning("apcu_fetch_ei() expects a string or an array of strings.");
+	RETURN_FALSE;
+}
+/* }}} */
+
 /* proto mixed apcu_exists(mixed key) */
 PHP_FUNCTION(apcu_exists) {
 	zval *key;
