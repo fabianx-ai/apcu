@@ -479,6 +479,9 @@ static apc_cache_entry_data_t *apc_persist_create_data(
 
 	data->owner = 0;
 	data->gc_next = 0;
+	data->ttl = 0;
+	data->ctime = 0;
+	data->mtime = 0;
 	data->dtime = 0;
 
 	/* Deep copy of the value */
@@ -590,10 +593,7 @@ void apc_persist_init_entry(
 		apc_cache_entry_t *entry, zend_string *key, zend_long mem_size, zend_uchar pooled) {
 	entry->next = 0;
 	entry->prev = 0;
-	entry->ttl = 0;
 	entry->nhits = 0;
-	entry->ctime = 0;
-	entry->mtime = 0;
 	entry->dtime = 0;
 	entry->atime = 0;
 	entry->mem_size = mem_size;

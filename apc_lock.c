@@ -47,6 +47,12 @@ static inline zend_bool apc_lock_wlock_impl(apc_lock_t *lock) {
 	return 1;
 }
 
+static inline zend_bool apc_lock_try_wlock_impl(apc_lock_t *lock) {
+	/* no native try operation on this backend; callers treat failure as
+	 * "somebody else will do the deferred work" */
+	return 0;
+}
+
 PHP_APCU_API zend_bool apc_lock_wunlock(apc_lock_t *lock) {
 	apc_windows_cs_unlock_wr(lock);
 	return 1;
@@ -100,6 +106,10 @@ static inline zend_bool apc_lock_rlock_impl(apc_lock_t *lock) {
 
 static inline zend_bool apc_lock_wlock_impl(apc_lock_t *lock) {
 	return pthread_rwlock_wrlock(lock) == 0;
+}
+
+static inline zend_bool apc_lock_try_wlock_impl(apc_lock_t *lock) {
+	return pthread_rwlock_trywrlock(lock) == 0;
 }
 
 PHP_APCU_API zend_bool apc_lock_wunlock(apc_lock_t *lock) {
@@ -159,6 +169,10 @@ static inline zend_bool apc_lock_rlock_impl(apc_lock_t *lock) {
 
 static inline zend_bool apc_lock_wlock_impl(apc_lock_t *lock) {
 	return pthread_mutex_lock(lock) == 0;
+}
+
+static inline zend_bool apc_lock_try_wlock_impl(apc_lock_t *lock) {
+	return pthread_mutex_trylock(lock) == 0;
 }
 
 PHP_APCU_API zend_bool apc_lock_wunlock(apc_lock_t *lock) {
@@ -235,6 +249,11 @@ static inline zend_bool apc_lock_wlock_impl(apc_lock_t *lock) {
 	return 1;
 }
 
+static inline zend_bool apc_lock_try_wlock_impl(apc_lock_t *lock) {
+	/* spinning IS trying; treat as best-effort no */
+	return 0;
+}
+
 PHP_APCU_API zend_bool apc_lock_wunlock(apc_lock_t *lock) {
 	apc_lock_release(lock);
 	return 1;
@@ -299,6 +318,11 @@ static inline zend_bool apc_lock_wlock_impl(apc_lock_t *lock) {
 	return 1;
 }
 
+static inline zend_bool apc_lock_try_wlock_impl(apc_lock_t *lock) {
+	/* no try variant wired for the fcntl fallback */
+	return 0;
+}
+
 PHP_APCU_API zend_bool apc_lock_wunlock(apc_lock_t *lock) {
 	apc_fcntl_call((*lock), F_SETLKW, F_UNLCK, 0, SEEK_SET, 0);
 	return 1;
@@ -325,6 +349,16 @@ PHP_APCU_API zend_bool apc_lock_wlock(apc_lock_t *lock) {
 
 	HANDLE_UNBLOCK_INTERRUPTIONS();
 	apc_warning("Failed to acquire write lock");
+	return 0;
+}
+
+PHP_APCU_API zend_bool apc_lock_try_wlock(apc_lock_t *lock) {
+	HANDLE_BLOCK_INTERRUPTIONS();
+	if (apc_lock_try_wlock_impl(lock)) {
+		return 1;
+	}
+
+	HANDLE_UNBLOCK_INTERRUPTIONS();
 	return 0;
 }
 

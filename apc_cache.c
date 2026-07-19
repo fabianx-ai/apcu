@@ -203,7 +203,29 @@ static void apc_cache_wlocked_detach_data(apc_cache_t *cache, apc_cache_entry_da
 		data->dtime = time(0);
 		data->gc_next = cache->header->gc_data;
 		cache->header->gc_data = DATAOF(data);
+		cache->header->nparked++;
 	}
+}
+
+/* Park a just-swapped-out data block on the data gc list. Runs under the
+ * READ lock: concurrent parkers push with a CAS loop (pushes happen only
+ * under the read lock, pops only under the write lock — no ABA). The block
+ * is NEVER freed here: a reader holding the same read lock may have loaded
+ * the pointer and not yet pinned it. Frees happen only in gc under the
+ * write lock, which excludes every rlock holder (DataSwap.tla:
+ * NoPinnedFree; the inline-free variant is refuted). */
+static void apc_cache_park_data(apc_cache_t *cache, apc_cache_entry_data_t *data, time_t t)
+{
+	uintptr_t self = DATAOF(data);
+
+	data->owner = 0;
+	data->dtime = t;
+
+	do {
+		data->gc_next = cache->header->gc_data;
+	} while (!ATOMIC_CAS(cache->header->gc_data, data->gc_next, self));
+
+	ATOMIC_INC_RLOCKED(cache->header->nparked);
 }
 
 /* These calculations can and should be done outside of a lock */
@@ -218,10 +240,13 @@ static inline zend_bool apc_entry_key_equals(const apc_cache_entry_t *entry, zen
 		&& memcmp(ZSTR_VAL(&entry->key), ZSTR_VAL(key), ZSTR_LEN(key)) == 0;
 }
 
-/* An entry is hard expired if the creation time is older than the per-entry TTL.
- * Hard expired entries must be treated identically to non-existent entries. */
-static zend_bool apc_cache_entry_hard_expired(apc_cache_entry_t *entry, time_t t) {
-	return entry->ttl && (time_t) (entry->ctime + entry->ttl) < t;
+/* An entry is hard expired if its value's store time is older than the value's
+ * TTL. Expiry lives in the data block: it is published atomically with the
+ * value, so no torn (ttl, ctime) pair can be observed (GH #345). The data
+ * pointer is loaded exactly once — a second load could straddle a swap. */
+static zend_bool apc_cache_entry_hard_expired(apc_cache_t *cache, apc_cache_entry_t *entry, time_t t) {
+	const apc_cache_entry_data_t *d = ENTRY_DATA(entry);
+	return d->ttl && (time_t) (d->ctime + d->ttl) < t;
 }
 
 /* An entry is soft expired if no per-entry TTL is set, a global cache TTL is set,
@@ -229,12 +254,13 @@ static zend_bool apc_cache_entry_hard_expired(apc_cache_entry_t *entry, time_t t
  * are accessible by lookup operation, but may be removed from the cache at any time. */
 static zend_bool apc_cache_entry_soft_expired(
 		apc_cache_t *cache, apc_cache_entry_t *entry, time_t t) {
-	return !entry->ttl && cache->ttl && (time_t) (entry->atime + cache->ttl) < t;
+	return !ENTRY_DATA(entry)->ttl && cache->ttl
+		&& (time_t) (entry->atime + cache->ttl) < t;
 }
 
 static zend_bool apc_cache_entry_expired(
 		apc_cache_t *cache, apc_cache_entry_t *entry, time_t t) {
-	return apc_cache_entry_hard_expired(entry, t)
+	return apc_cache_entry_hard_expired(cache, entry, t)
 		|| apc_cache_entry_soft_expired(cache, entry, t);
 }
 
@@ -426,6 +452,7 @@ static void apc_cache_wlocked_gc(apc_cache_t* cache)
 
 		/* set next and free current block */
 		*data_offset = data->gc_next;
+		cache->header->nparked--;
 		free_data(cache, data);
 	}
 
@@ -576,7 +603,7 @@ static apc_cache_entry_t *apc_cache_wlocked_find_slot(
 
 		/* check for a match by hash and string */
 		if (apc_entry_key_equals(entry, key)) {
-			if (apc_cache_entry_hard_expired(entry, t)) {
+			if (apc_cache_entry_hard_expired(cache, entry, t)) {
 				apc_cache_wlocked_remove_entry(cache, entry);
 				continue;
 			}
@@ -617,10 +644,11 @@ static void apc_cache_wlocked_attach_data(
 	cache->header->mem_size += data->mem_size;
 	cache->header->ninserts++;
 
-	entry->ttl = ttl;
+	data->ttl = ttl;
+	data->ctime = t;
+	data->mtime = t;
+
 	entry->nhits = 0;
-	entry->ctime = t;
-	entry->mtime = t;
 	entry->atime = t;
 	entry->dtime = 0;
 
@@ -729,7 +757,7 @@ static inline apc_cache_entry_t *apc_cache_rlocked_find_nostat(
 		/* check for a matching key by has and identifier */
 		if (apc_entry_key_equals(entry, key)) {
 			/* Check to make sure this entry isn't expired by a hard TTL */
-			if (apc_cache_entry_hard_expired(entry, t)) {
+			if (apc_cache_entry_hard_expired(cache, entry, t)) {
 				break;
 			}
 
@@ -757,7 +785,7 @@ static inline apc_cache_entry_t *apc_cache_rlocked_find(
 		/* check for a matching key by has and identifier */
 		if (apc_entry_key_equals(entry, key)) {
 			/* Check to make sure this entry isn't expired by a hard TTL */
-			if (apc_cache_entry_hard_expired(entry, t)) {
+			if (apc_cache_entry_hard_expired(cache, entry, t)) {
 				break;
 			}
 
@@ -822,6 +850,80 @@ static zend_bool apc_cache_store_ex(
 		return 0;
 	}
 
+	/* Existing keys take the fast path: the value pointer is swapped under
+	 * the READ lock — writers to existing keys behave like readers and no
+	 * longer queue on (or exclude anyone from) the write lock (GH #345).
+	 * New keys, and the update flavor's identical-refresh (which mutates the
+	 * current block's metadata), fall through to the write-lock path.
+	 * With a global cache ttl configured, stores keep the write-locked slot
+	 * walk that soft-expiry reaping relies on (see apc_019.phpt), so the
+	 * fast path is limited to the apc.ttl=0 default. */
+	if (cache->ttl == 0 && apc_cache_rlock(cache)) {
+		apc_cache_entry_t *entry = apc_cache_rlocked_find_nostat(cache, key, t);
+		zend_bool handled = 0;
+
+		if (entry) {
+			apc_cache_entry_data_t *cur = ENTRY_DATA(entry);
+
+			if (exclusive) {
+				/* apcu_add: a live entry exists */
+				handled = 1;
+			} else if (skipped && ei && apc_data_ei_matches(cur, ei)) {
+				/* apcu_add_ei: identifier already present — strict no-op */
+				ATOMIC_INC_RLOCKED(cache->header->nskipped);
+				*skipped = 1;
+				ret = 1;
+				handled = 1;
+			} else if (skipped && !ei && apc_data_payloads_identical(cur, data)) {
+				/* identical value: the metadata refresh needs the write lock */
+			} else {
+				apc_cache_entry_data_t *old;
+
+				/* publish: metadata is written into the (unreachable)
+				 * candidate first, the exchange releases it atomically */
+				data->ttl = ttl;
+				data->ctime = t;
+				data->mtime = t;
+				data->owner = ENTRYOF(entry);
+
+				old = DATAAT(ATOMIC_XCHG_PTR(entry->data, DATAOF(data)));
+
+				apc_cache_park_data(cache, old, t);
+
+				ATOMIC_ADD(cache->header->mem_size, data->mem_size - old->mem_size);
+				ATOMIC_INC_RLOCKED(cache->header->ninserts);
+				entry->nhits = 0;
+				entry->atime = t;
+
+				/* drop the creation reference; readers may already pin it */
+				ATOMIC_DEC(data->ref_count);
+
+				data = NULL; /* consumed */
+				ret = 1;
+				handled = 1;
+			}
+		}
+		apc_cache_runlock(cache);
+
+		if (handled) {
+			if (data) {
+				/* unconsumed candidate (add-fail or ei-skip): never published */
+				free_data(cache, data);
+			}
+
+			/* A swap-only workload never takes the write lock, so nobody
+			 * would ever drain the parked blocks: past a threshold, try to
+			 * take it — without waiting — and reap. Skipping under contention
+			 * is fine: some later swapper (or any write-locked operation)
+			 * will get it, and memory stays recycled instead of streamed. */
+			if (ret && cache->header->nparked >= 64 && apc_cache_try_wlock(cache)) {
+				apc_cache_wlocked_gc(cache);
+				apc_cache_wunlock(cache);
+			}
+			return ret;
+		}
+	}
+
 	while (!done) {
 		done = 1;
 
@@ -853,10 +955,12 @@ static zend_bool apc_cache_store_ex(
 					ret = 1;
 				} else if (skipped && !ei
 						&& apc_data_payloads_identical(ENTRY_DATA(entry), data)) {
-					/* apcu_update: identical value — refresh metadata only */
-					entry->ttl = ttl;
-					entry->ctime = t;
-					entry->mtime = t;
+					/* apcu_update: identical value — refresh metadata only
+					 * (in place: the write lock excludes all readers) */
+					apc_cache_entry_data_t *d = ENTRY_DATA(entry);
+					d->ttl = ttl;
+					d->ctime = t;
+					d->mtime = t;
 					entry->atime = t;
 					cache->header->nskipped++;
 					*skipped = 1;
@@ -946,9 +1050,12 @@ static zend_bool apc_cache_wlocked_refresh_identical(
 		return 0;
 	}
 
-	entry->ttl = ttl;
-	entry->ctime = t;
-	entry->mtime = t;
+	{
+		apc_cache_entry_data_t *d = ENTRY_DATA(entry);
+		d->ttl = ttl;
+		d->ctime = t;
+		d->mtime = t;
+	}
 	entry->atime = t;
 	cache->header->nskipped++;
 	return 1;
@@ -1457,10 +1564,12 @@ retry_update:
 
 	entry = apc_cache_rlocked_find_nostat(cache, key, t);
 	if (entry) {
+		apc_cache_entry_data_t *d = ENTRY_DATA(entry);
+
 		/* Only allow changes to simple values */
-		if (Z_TYPE(ENTRY_DATA(entry)->val) < IS_STRING) {
-			retval = updater(cache, ENTRY_DATA(entry), data);
-			entry->mtime = t;
+		if (Z_TYPE(d->val) < IS_STRING) {
+			retval = updater(cache, d, data);
+			d->mtime = t;
 		}
 
 		apc_cache_wunlock(cache);
@@ -1505,11 +1614,17 @@ retry_update:
 
 	entry = apc_cache_rlocked_find_nostat(cache, key, t);
 	if (entry) {
-		/* Only supports integers; the value is mutated in place inside the
-		 * data block, which cannot be swapped or moved under the read lock. */
-		if (Z_TYPE(ENTRY_DATA(entry)->val) == IS_LONG) {
-			retval = updater(cache, &Z_LVAL(ENTRY_DATA(entry)->val), data);
-			entry->mtime = t;
+		/* Load the data pointer ONCE: a concurrent store may swap the entry's
+		 * value under this same read lock (GH #345). The loaded block cannot
+		 * be freed or moved while the read lock is held; an update landing in
+		 * a just-parked block is the ordinary lost-to-a-concurrent-store race,
+		 * identical to the serialized orders. */
+		apc_cache_entry_data_t *d = ENTRY_DATA(entry);
+
+		/* Only supports integers */
+		if (Z_TYPE(d->val) == IS_LONG) {
+			retval = updater(cache, &Z_LVAL(d->val), data);
+			d->mtime = t;
 		}
 
 		apc_cache_runlock(cache);
@@ -1597,10 +1712,13 @@ static zval apc_cache_link_info(apc_cache_t *cache, apc_cache_entry_t *p)
 	ZVAL_STR(&zv, zend_string_dup(&p->key, 0));
 	zend_hash_add_new(Z_ARRVAL(link), apc_str_info, &zv);
 
-	array_add_long(&link, apc_str_ttl, p->ttl);
-	array_add_double(&link, apc_str_num_hits, (double) p->nhits);
-	array_add_long(&link, apc_str_mtime, p->mtime);
-	array_add_long(&link, apc_str_creation_time, p->ctime);
+	{
+		const apc_cache_entry_data_t *d = p->data ? ENTRY_DATA(p) : NULL;
+		array_add_long(&link, apc_str_ttl, d ? d->ttl : 0);
+		array_add_double(&link, apc_str_num_hits, (double) p->nhits);
+		array_add_long(&link, apc_str_mtime, d ? d->mtime : 0);
+		array_add_long(&link, apc_str_creation_time, d ? d->ctime : 0);
+	}
 	array_add_long(&link, apc_str_deletion_time, p->dtime);
 	array_add_long(&link, apc_str_access_time, p->atime);
 	array_add_long(&link, apc_str_ref_count, p->ref_count);
@@ -1719,12 +1837,15 @@ PHP_APCU_API void apc_cache_stat(apc_cache_t *cache, zend_string *key, zval *sta
 			/* check for a matching key by has and identifier */
 			if (apc_entry_key_equals(entry, key)) {
 				array_init(stat);
-				array_add_long(stat, apc_str_hits, entry->nhits);
-				array_add_long(stat, apc_str_access_time, entry->atime);
-				array_add_long(stat, apc_str_mtime, entry->mtime);
-				array_add_long(stat, apc_str_creation_time, entry->ctime);
-				array_add_long(stat, apc_str_deletion_time, entry->dtime);
-				array_add_long(stat, apc_str_ttl, entry->ttl);
+				{
+					const apc_cache_entry_data_t *d = ENTRY_DATA(entry);
+					array_add_long(stat, apc_str_hits, entry->nhits);
+					array_add_long(stat, apc_str_access_time, entry->atime);
+					array_add_long(stat, apc_str_mtime, d->mtime);
+					array_add_long(stat, apc_str_creation_time, d->ctime);
+					array_add_long(stat, apc_str_deletion_time, entry->dtime);
+					array_add_long(stat, apc_str_ttl, d->ttl);
+				}
 				array_add_long(stat, apc_str_refs, entry->ref_count);
 				if (entry->data && ENTRY_DATA(entry)->ei) {
 					zend_string *ei = apc_data_fetch_ei(ENTRY_DATA(entry));

@@ -81,6 +81,7 @@ PHP_APCU_API void      apc_lock_cleanup(void);
 PHP_APCU_API zend_bool apc_lock_create(apc_lock_t *lock);
 PHP_APCU_API zend_bool apc_lock_rlock(apc_lock_t *lock);
 PHP_APCU_API zend_bool apc_lock_wlock(apc_lock_t *lock);
+PHP_APCU_API zend_bool apc_lock_try_wlock(apc_lock_t *lock);
 PHP_APCU_API zend_bool apc_lock_runlock(apc_lock_t *lock);
 PHP_APCU_API zend_bool apc_lock_wunlock(apc_lock_t *lock);
 PHP_APCU_API void apc_lock_destroy(apc_lock_t *lock);
@@ -89,6 +90,7 @@ PHP_APCU_API void apc_lock_destroy(apc_lock_t *lock);
 #define CREATE_LOCK(lock)     apc_lock_create(lock)
 #define DESTROY_LOCK(lock)    apc_lock_destroy(lock)
 #define WLOCK(lock)           apc_lock_wlock(lock)
+#define TRY_WLOCK(lock)       apc_lock_try_wlock(lock)
 #define WUNLOCK(lock)         { apc_lock_wunlock(lock); HANDLE_UNBLOCK_INTERRUPTIONS(); }
 #define RLOCK(lock)           apc_lock_rlock(lock)
 #define RUNLOCK(lock)         { apc_lock_runlock(lock); HANDLE_UNBLOCK_INTERRUPTIONS(); }
@@ -106,11 +108,20 @@ PHP_APCU_API void apc_lock_destroy(apc_lock_t *lock);
 #  define ATOMIC_ADD(a, b) (InterlockedExchangeAdd(&a, b) + b)
 #  define ATOMIC_CAS(a, old, new) (InterlockedCompareExchange(&a, new, old) == old)
 # endif
+# ifdef _WIN64
+#  define ATOMIC_XCHG_PTR(a, v) ((uintptr_t) InterlockedExchange64((LONG64 *) &(a), (LONG64) (v)))
+# else
+#  define ATOMIC_XCHG_PTR(a, v) ((uintptr_t) InterlockedExchange((LONG *) &(a), (LONG) (v)))
+# endif
 #else
 # define ATOMIC_INC(a) __sync_add_and_fetch(&a, 1)
 # define ATOMIC_DEC(a) __sync_sub_and_fetch(&a, 1)
 # define ATOMIC_ADD(a, b) __sync_add_and_fetch(&a, b)
 # define ATOMIC_CAS(a, old, new) __sync_bool_compare_and_swap(&a, old, new)
+/* exchange with release semantics: everything written into a block must be
+ * visible before the published pointer is (readers order via the data
+ * dependency on the loaded pointer) */
+# define ATOMIC_XCHG_PTR(a, v) __atomic_exchange_n(&(a), (v), __ATOMIC_ACQ_REL)
 #endif
 
 #endif

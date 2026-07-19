@@ -59,6 +59,10 @@ struct apc_cache_entry_data_t {
 	uintptr_t gc_next;       /* next data block on the data gc list (only while detached) */
 	zend_long ref_count;     /* readers currently unpersisting from this block */
 	zend_long mem_size;      /* size of this allocation */
+	zend_long ttl;           /* the ttl of this value (expiry travels with the value: it is
+	                          * published atomically with it and can never be torn — GH #345) */
+	time_t ctime;            /* time this value was stored (the expiry base) */
+	time_t mtime;            /* last modification (ctime, or the last in-place inc/cas) */
 	time_t dtime;            /* time the block was detached from its entry */
 	uintptr_t ei;            /* offset to the expiration identifier string, 0 if none */
 	zval val;                /* the zval copied at store time */
@@ -68,16 +72,14 @@ typedef struct apc_cache_entry_t apc_cache_entry_t;
 struct apc_cache_entry_t {
 	uintptr_t next;          /* offset to next entry (MUST BE THE 1st FIELD OF THE STRUCT!) */
 	uintptr_t prev;          /* offset to previous entry / head-pointer of the linked list */
-	zend_long ttl;           /* the ttl on this specific entry */
 	zend_long ref_count;     /* the reference count of this entry */
 	zend_long nhits;         /* number of hits to this entry */
-	time_t ctime;            /* time entry was initialized */
-	time_t mtime;            /* the mtime of this cached entry */
 	time_t dtime;            /* time entry was removed from cache */
 	time_t atime;            /* time entry was last accessed */
 	zend_long mem_size;      /* memory used by this block (the value is accounted separately) */
 	zend_uchar pooled;       /* 0: directly allocated; 1: live pool slot; 2: free pool slot */
-	uintptr_t data;          /* offset (from cache header) of the entry's apc_cache_entry_data_t */
+	uintptr_t data;          /* offset (from cache header) of the entry's apc_cache_entry_data_t;
+	                          * swapped ATOMICALLY under the read lock by value updates (GH #345) */
 	zend_string key;         /* entry key (MUST BE THE LAST FIELD OF THE STRUCT!) */
 };
 
@@ -97,6 +99,7 @@ typedef struct _apc_cache_header_t {
 	apc_cache_slam_key_t lastkey;   /* last key inserted (not necessarily without error) */
 	uintptr_t gc;                   /* offset in shm to the first entry of gc list */
 	uintptr_t gc_data;              /* offset in shm to the first detached data block of the data gc list */
+	zend_long nparked;              /* number of blocks on gc_data (drain trigger for read-locked swaps) */
 	uintptr_t entry_pool;           /* offset in shm to the first free slot of the entry pool */
 	uintptr_t pool_batches;         /* offset in shm to the first entry-pool batch block */
 } apc_cache_header_t;
@@ -337,6 +340,13 @@ PHP_APCU_API void apc_cache_entry(apc_cache_t *cache, zend_string *key, zend_fca
 static inline zend_bool apc_cache_wlock(apc_cache_t *cache) {
 	if (!APCG(entry_level)) {
 		return WLOCK(&cache->header->lock);
+	}
+	return 1;
+}
+
+static inline zend_bool apc_cache_try_wlock(apc_cache_t *cache) {
+	if (!APCG(entry_level)) {
+		return TRY_WLOCK(&cache->header->lock);
 	}
 	return 1;
 }

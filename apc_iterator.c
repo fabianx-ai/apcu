@@ -82,11 +82,11 @@ static apc_iterator_item_t* apc_iterator_item_ctor(
 		zend_hash_add_new(ht, apc_str_num_hits, &zv);
 	}
 	if (APC_ITER_MTIME & iterator->format) {
-		ZVAL_LONG(&zv, entry->mtime);
+		ZVAL_LONG(&zv, data ? data->mtime : 0);
 		zend_hash_add_new(ht, apc_str_mtime, &zv);
 	}
 	if (APC_ITER_CTIME & iterator->format) {
-		ZVAL_LONG(&zv, entry->ctime);
+		ZVAL_LONG(&zv, data ? data->ctime : 0);
 		zend_hash_add_new(ht, apc_str_creation_time, &zv);
 	}
 	if (APC_ITER_DTIME & iterator->format) {
@@ -108,7 +108,7 @@ static apc_iterator_item_t* apc_iterator_item_ctor(
 		zend_hash_add_new(ht, apc_str_mem_size, &zv);
 	}
 	if (APC_ITER_TTL & iterator->format) {
-		ZVAL_LONG(&zv, entry->ttl);
+		ZVAL_LONG(&zv, data ? data->ttl : 0);
 		zend_hash_add_new(ht, apc_str_ttl, &zv);
 	}
 
@@ -196,8 +196,9 @@ static int apc_iterator_search_match(apc_iterator_t *iterator, apc_cache_entry_t
 
 static int apc_iterator_check_expiry(apc_cache_t* cache, apc_cache_entry_t *entry, time_t t)
 {
-	if (entry->ttl) {
-		if ((time_t) (entry->ctime + entry->ttl) < t) {
+	const apc_cache_entry_data_t *d = ENTRY_DATA(entry);
+	if (d->ttl) {
+		if ((time_t) (d->ctime + d->ttl) < t) {
 			return 0;
 		}
 	}
